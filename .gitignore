@@ -1,0 +1,116 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv/
+.env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.VSCodeCounter/
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Project specific
+logs/
+temp/
+*.log
+*.tmp
+
+# Whisper project directory (complete source code)
+# Ignore the entire whisper directory to avoid including large codebase
+model/whisper/
+!model/whisper/README.md
+
+# Downloaded model files (if any)
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Models directory (if contains large files)
+models/
+
+# Cache and temporary files
+.pytest_cache/
+.cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local configuration files
+config_local.py
+*.local
+.env.local
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Media files for testing (optional - remove if you want to include test media)
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.wmv
+*.flv
+*.webm
+*.m4v
+*.3gp
+*.wav
+*.mp3
+*.aac
+*.flac
+*.ogg
+*.wma
+
+# Subtitle files (temporary)
+*.srt
+*.vtt
+*.ass
+*.sub
+*.idx
+
+# FFmpeg temporary files
+ffmpeg2pass-*
+*.ffmpeg

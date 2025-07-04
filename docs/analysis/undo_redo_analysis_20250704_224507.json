@@ -1,0 +1,16 @@
+{
+  "timestamp": "20250704_224507",
+  "total_tests": 1,
+  "passed": 0,
+  "failed": 1,
+  "errors": [
+    "测试执行: 测试执行过程中发生错误: MainWindow.__init__() missing 2 required positional arguments: 'config' and 'temp_manager'"
+  ],
+  "tests": [
+    {
+      "name": "测试执行",
+      "passed": false,
+      "message": "测试执行过程中发生错误: MainWindow.__init__() missing 2 required positional arguments: 'config' and 'temp_manager'"
+    }
+  ]
+}

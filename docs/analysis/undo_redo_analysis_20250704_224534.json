@@ -1,0 +1,16 @@
+{
+  "timestamp": "20250704_224534",
+  "total_tests": 1,
+  "passed": 0,
+  "failed": 1,
+  "errors": [
+    "测试执行: 测试执行过程中发生错误: 'ConfigManager' object has no attribute 'get_config'"
+  ],
+  "tests": [
+    {
+      "name": "测试执行",
+      "passed": false,
+      "message": "测试执行过程中发生错误: 'ConfigManager' object has no attribute 'get_config'"
+    }
+  ]
+}
