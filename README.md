@@ -226,7 +226,7 @@ VideoTranslator/
 
 ### 1. 克隆项目
 ```bash
-git clone https://github.com/yourusername/VideoTranslator.git
+[git clone https://github.com/yourusername/VideoTranslator.git](https://github.com/YinChingZ/VideoTranslator.git)
 cd VideoTranslator
 ```
 
