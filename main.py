@@ -1,88 +1,20 @@
-import sys
-import os
-import logging
 import argparse
+import logging
+import os
+import sys
+
+from PyQt5.QtCore import QCoreApplication, Qt
 from PyQt5.QtWidgets import QApplication
-from PyQt5.QtCore import Qt, QCoreApplication
 
 # 添加项目根目录到 Python 路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+from app.config import get_config_manager
 from app.gui.main_window import MainWindow
 from app.utils.logger import setup_logger
-from app.config import get_config_manager
+from app.utils.system_health_checker import can_start_application, perform_startup_check
 from app.utils.temp_files import TempFileManager
-from app.utils.system_health_checker import perform_startup_check, can_start_application
 
-def check_dependencies():
-    """全面检查系统依赖是否正确安装"""
-    missing_deps = []
-    failed_checks = []
-    
-    # 检查Python版本
-    import sys
-    if sys.version_info < (3, 8):
-        failed_checks.append(f"Python版本过低 ({sys.version}), 需要3.8+")
-    
-    # 检查关键Python包
-    required_packages = {
-        'PyQt5': 'PyQt5',
-        'ffmpeg-python': 'ffmpeg',
-        'whisper': 'openai-whisper',
-        'requests': 'requests',
-        'numpy': 'numpy',
-        'sqlite3': None  # 内置模块
-    }
-    
-    for package, pip_name in required_packages.items():
-        try:
-            __import__(package)
-        except ImportError:
-            if pip_name:
-                missing_deps.append(f"{package} (安装: pip install {pip_name})")
-            else:
-                failed_checks.append(f"内置模块 {package} 不可用")
-    
-    # 检查FFmpeg可执行文件
-    import subprocess
-    ffmpeg_commands = ['ffmpeg', 'ffprobe']
-    for cmd in ffmpeg_commands:
-        try:
-            subprocess.check_output([cmd, '-version'], 
-                                   stderr=subprocess.STDOUT, 
-                                   timeout=5)
-        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
-            failed_checks.append(f"{cmd} 不可用 (请安装FFmpeg并添加到PATH)")
-    
-    # 检查磁盘空间 (至少1GB)
-    import shutil
-    try:
-        free_space = shutil.disk_usage('.').free / (1024**3)  # GB
-        if free_space < 1:
-            failed_checks.append(f"磁盘空间不足 ({free_space:.1f}GB), 建议至少1GB")
-    except Exception:
-        pass
-    
-    # 检查网络连接（可选）
-    try:
-        import urllib.request
-        urllib.request.urlopen('https://www.google.com', timeout=3)
-    except Exception:
-        # 网络问题不是致命错误，只记录警告
-        logging.warning("网络连接检查失败，某些功能可能受限")
-    
-    # 汇总检查结果
-    if missing_deps or failed_checks:
-        error_msg = "系统依赖检查失败:\n"
-        if missing_deps:
-            error_msg += "\n缺少Python包:\n" + "\n".join(f"  - {dep}" for dep in missing_deps)
-        if failed_checks:
-            error_msg += "\n系统环境问题:\n" + "\n".join(f"  - {check}" for check in failed_checks)
-        
-        logging.error(error_msg)
-        return False, error_msg
-    
-    return True, "所有依赖检查通过"
 
 def parse_arguments():
     """处理命令行参数"""
@@ -182,37 +114,25 @@ def main():
         msg_box.exec()
         return 1
     
-    # 显示健康检查结果（如果有警告）
-    if health_report['warnings_count'] > 0:
-        from PyQt5.QtWidgets import QMessageBox
-        msg_box = QMessageBox()
-        msg_box.setIcon(QMessageBox.Icon.Warning)
-        msg_box.setWindowTitle("系统环境警告")
-        msg_box.setText(f"发现 {health_report['warnings_count']} 个警告，应用可以启动但可能影响部分功能。")
-        msg_box.setInformativeText("建议查看详细信息并考虑解决这些问题。")
-        
-        warning_details = "\n".join([f"• {warning}" for warning in health_report['warnings']])
-        if health_report['recommendations']:
-            warning_details += "\n\n建议:\n" + "\n".join(health_report['recommendations'])
-        
-        msg_box.setDetailedText(warning_details)
-        msg_box.setStandardButtons(QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Ignore)
-        msg_box.setDefaultButton(QMessageBox.StandardButton.Ok)
-        
-        result = msg_box.exec()
-        if result == QMessageBox.StandardButton.Ignore:
-            logging.info("用户选择忽略系统警告，继续启动应用")
-    
     logging.info(f"系统健康检查完成: {health_report['status_message']}")
     
     # 创建并显示主窗口
     window = MainWindow(config, temp_manager)
+    if health_report['warnings_count'] > 0:
+        report_path = health_report.get("report_path")
+        window.status_label.setText(
+            f"就绪 · {health_report['warnings_count']} 项可选能力受限"
+        )
+        tooltip = "\n".join(health_report["warnings"])
+        if report_path:
+            tooltip += f"\n\n完整报告：{report_path}"
+        window.status_label.setToolTip(tooltip)
     window.show()
     
     # 如果提供了文件参数，直接打开该文件
     if args.file and os.path.exists(args.file):
         window.open_video(args.file)
-    else:
+    elif health_report['warnings_count'] == 0:
         # 没有文件参数时，显示欢迎信息
         logging.info("应用程序启动，等待用户操作")
         window.status_label.setText("就绪，请打开或导入视频文件")

@@ -5,14 +5,18 @@ Checkpoint Manager for video processing recovery.
 提供处理过程中的断点续传和错误恢复功能。
 """
 
-import os
-import json
-import time
-import logging
 import hashlib
-from typing import Dict, Any, Optional, List
-from dataclasses import dataclass, asdict
+import json
+import logging
+import os
+import tempfile
+import threading
+import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from app.utils.paths import ensure_private_directory, get_checkpoint_dir
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +43,7 @@ class ProcessingCheckpoint:
     timestamp: float
     completed_stages: List[str]
     stage_data: Dict[str, Any]
-    version: str = "1.0.0"
+    version: str = "2.0.0"
 
 class CheckpointManager:
     """断点续传管理器"""
@@ -49,13 +53,13 @@ class CheckpointManager:
         初始化检查点管理器
         
         Args:
-            project_dir: 项目目录，默认为用户目录下的.videotranslator
+            project_dir: 检查点目录；默认使用平台应用状态目录
         """
         if project_dir is None:
-            project_dir = os.path.expanduser("~/.videotranslator/checkpoints")
+            project_dir = get_checkpoint_dir()
         
-        self.project_dir = Path(project_dir)
-        self.project_dir.mkdir(parents=True, exist_ok=True)
+        self.project_dir = ensure_private_directory(Path(project_dir).expanduser())
+        self._lock = threading.RLock()
         
         # 定义处理阶段
         self.STAGES = [
@@ -73,18 +77,19 @@ class CheckpointManager:
     
     def _get_video_hash(self, video_path: str) -> str:
         """计算视频文件的哈希值用于唯一标识"""
+        canonical_path = str(Path(video_path).expanduser().resolve())
         try:
             hasher = hashlib.md5()
             # 使用文件路径和大小计算哈希（避免读取整个文件）
-            hasher.update(video_path.encode('utf-8'))
-            if os.path.exists(video_path):
-                stat = os.stat(video_path)
+            hasher.update(canonical_path.encode('utf-8'))
+            if os.path.exists(canonical_path):
+                stat = os.stat(canonical_path)
                 hasher.update(str(stat.st_size).encode('utf-8'))
                 hasher.update(str(stat.st_mtime).encode('utf-8'))
             return hasher.hexdigest()
         except Exception as e:
             logger.warning(f"计算视频哈希失败: {e}")
-            return hashlib.md5(video_path.encode('utf-8')).hexdigest()
+            return hashlib.md5(canonical_path.encode('utf-8')).hexdigest()
     
     def _get_checkpoint_file(self, video_path: str) -> Path:
         """获取检查点文件路径"""
@@ -106,67 +111,115 @@ class CheckpointManager:
         Returns:
             保存成功返回True
         """
+        if stage not in self.STAGES:
+            logger.error("拒绝保存未知处理阶段: %s", stage)
+            return False
+
         try:
-            checkpoint_file = self._get_checkpoint_file(video_path)
-            
-            # 加载现有检查点或创建新的
-            if checkpoint_file.exists():
-                try:
-                    with open(checkpoint_file, 'r', encoding='utf-8') as f:
-                        existing_data = json.load(f)
-                    checkpoint = ProcessingCheckpoint(**existing_data)
-                except (json.JSONDecodeError, TypeError) as e:
-                    logger.warning(f"现有检查点文件损坏，将创建新的: {e}")
-                    # 删除损坏的文件
-                    checkpoint_file.unlink()
-                    # 创建新的检查点
-                    checkpoint = ProcessingCheckpoint(
-                        video_path=video_path,
-                        video_hash=self._get_video_hash(video_path),
-                        source_language=kwargs.get('source_language', 'auto'),
-                        target_language=kwargs.get('target_language', 'zh-CN'),
-                        whisper_model=kwargs.get('whisper_model', 'base'),
-                        translation_provider=kwargs.get('translation_provider', 'openai'),
-                        timestamp=time.time(),
-                        completed_stages=[],
-                        stage_data={}
-                    )
-            else:
-                checkpoint = ProcessingCheckpoint(
-                    video_path=video_path,
-                    video_hash=self._get_video_hash(video_path),
-                    source_language=kwargs.get('source_language', 'auto'),
-                    target_language=kwargs.get('target_language', 'zh-CN'),
-                    whisper_model=kwargs.get('whisper_model', 'base'),
-                    translation_provider=kwargs.get('translation_provider', 'openai'),
-                    timestamp=time.time(),
-                    completed_stages=[],
-                    stage_data={}
-                )
-            
-            # 更新检查点数据
-            if stage not in checkpoint.completed_stages:
-                checkpoint.completed_stages.append(stage)
-            
-            checkpoint.stage_data[stage] = stage_data
-            checkpoint.timestamp = time.time()
-            
-            # 保存到文件
-            checkpoint_data = asdict(checkpoint)
-            # 序列化 Path 对象
-            checkpoint_data = serialize_for_json(checkpoint_data)
-            
-            with open(checkpoint_file, 'w', encoding='utf-8') as f:
-                json.dump(checkpoint_data, f, ensure_ascii=False, indent=2)
-            
-            logger.info(f"检查点已保存: {stage} for {os.path.basename(video_path)}")
-            return True
-            
+            with self._lock:
+                return self._save_checkpoint_locked(video_path, stage, stage_data, **kwargs)
         except Exception as e:
             logger.error(f"保存检查点失败: {e}")
             return False
+
+    def _save_checkpoint_locked(self, video_path: str, stage: str,
+                                stage_data: Dict[str, Any], **kwargs) -> bool:
+        """在持有进程内锁时更新并原子写入检查点。"""
+        checkpoint_file = self._get_checkpoint_file(video_path)
+        expected_settings = self._normalise_settings(kwargs)
+            
+        # 加载现有检查点或创建新的
+        if checkpoint_file.exists():
+            try:
+                with open(checkpoint_file, 'r', encoding='utf-8') as f:
+                    existing_data = json.load(f)
+                checkpoint = ProcessingCheckpoint(**existing_data)
+                incompatible_version = str(checkpoint.version).split('.', 1)[0] != '2'
+                if incompatible_version or (
+                    expected_settings and not self._settings_match(checkpoint, expected_settings)
+                ):
+                    logger.info("处理设置已变化，丢弃旧检查点: %s", checkpoint_file)
+                    checkpoint = self._new_checkpoint(video_path, expected_settings)
+            except (json.JSONDecodeError, TypeError) as e:
+                logger.warning(f"现有检查点文件损坏，将创建新的: {e}")
+                checkpoint_file.unlink()
+                checkpoint = self._new_checkpoint(video_path, expected_settings)
+        else:
+            checkpoint = self._new_checkpoint(video_path, expected_settings)
+            
+        # 更新检查点数据
+        if stage not in checkpoint.completed_stages:
+            checkpoint.completed_stages.append(stage)
+            
+        checkpoint.stage_data[stage] = stage_data
+        checkpoint.timestamp = time.time()
+            
+        checkpoint_data = serialize_for_json(asdict(checkpoint))
+            
+        self._atomic_write_json(checkpoint_file, checkpoint_data)
+            
+        logger.info(f"检查点已保存: {stage} for {os.path.basename(video_path)}")
+        return True
+
+    @staticmethod
+    def _normalise_settings(settings: Dict[str, Any]) -> Dict[str, str]:
+        """提取会影响处理结果的设置并规范化其值。"""
+        keys = (
+            'source_language', 'target_language',
+            'whisper_model', 'translation_provider'
+        )
+        return {
+            key: str(settings[key]).strip().lower()
+            for key in keys if settings.get(key) is not None
+        }
+
+    def _new_checkpoint(self, video_path: str,
+                        settings: Dict[str, str]) -> ProcessingCheckpoint:
+        return ProcessingCheckpoint(
+            video_path=str(Path(video_path).resolve()),
+            video_hash=self._get_video_hash(video_path),
+            source_language=settings.get('source_language', 'auto'),
+            target_language=settings.get('target_language', 'zh-cn'),
+            whisper_model=settings.get('whisper_model', 'base'),
+            translation_provider=settings.get('translation_provider', 'openai'),
+            timestamp=time.time(),
+            completed_stages=[],
+            stage_data={}
+        )
+
+    @staticmethod
+    def _settings_match(checkpoint: ProcessingCheckpoint,
+                        expected: Dict[str, str]) -> bool:
+        for key, value in expected.items():
+            current = str(getattr(checkpoint, key, '')).strip().lower()
+            if current != value:
+                return False
+        return True
+
+    def _atomic_write_json(self, destination: Path, data: Dict[str, Any]) -> None:
+        """先写同目录临时文件，再替换目标，避免中断产生半文件。"""
+        temp_name = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode='w', encoding='utf-8', dir=destination.parent,
+                prefix=f".{destination.name}.", suffix='.tmp', delete=False
+            ) as handle:
+                temp_name = handle.name
+                json.dump(data, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.chmod(temp_name, 0o600)
+            except OSError:
+                # Some Windows/network filesystems do not implement POSIX
+                # permission bits; the containing directory is private.
+                pass
+            os.replace(temp_name, destination)
+        finally:
+            if temp_name and os.path.exists(temp_name):
+                os.unlink(temp_name)
     
-    def load_checkpoint(self, video_path: str) -> Optional[ProcessingCheckpoint]:
+    def load_checkpoint(self, video_path: str, **expected_settings) -> Optional[ProcessingCheckpoint]:
         """
         加载处理检查点
         
@@ -182,14 +235,20 @@ class CheckpointManager:
             if not checkpoint_file.exists():
                 return None
 
-            with open(checkpoint_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+            with self._lock:
+                with open(checkpoint_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
             
             checkpoint = ProcessingCheckpoint(**data)
             
             # 验证检查点有效性
             if not self._validate_checkpoint(checkpoint, video_path):
                 logger.warning(f"检查点验证失败，将被忽略: {checkpoint_file}")
+                return None
+
+            normalised = self._normalise_settings(expected_settings)
+            if normalised and not self._settings_match(checkpoint, normalised):
+                logger.info("检查点设置与当前任务不一致，将重新处理: %s", checkpoint_file)
                 return None
             
             return checkpoint
@@ -225,16 +284,28 @@ class CheckpointManager:
                 return False
             
             # 验证版本兼容性
-            # 可以在这里添加版本检查逻辑
+            if str(checkpoint.version).split('.', 1)[0] != '2':
+                return False
+
+            # 恢复所依赖的临时产物必须仍然存在。
+            artifact_keys = {
+                'audio_extraction': 'audio_path',
+                'subtitle_generation': 'subtitle_path',
+            }
+            for stage, key in artifact_keys.items():
+                if stage in checkpoint.completed_stages:
+                    value = checkpoint.stage_data.get(stage, {}).get(key)
+                    if not value or not os.path.exists(value):
+                        return False
             
             return True
             
         except Exception:
             return False
     
-    def can_resume(self, video_path: str) -> bool:
+    def can_resume(self, video_path: str, **expected_settings) -> bool:
         """检查是否可以恢复处理"""
-        checkpoint = self.load_checkpoint(video_path)
+        checkpoint = self.load_checkpoint(video_path, **expected_settings)
         return checkpoint is not None and len(checkpoint.completed_stages) > 0
     
     def get_next_stage(self, video_path: str) -> Optional[str]:
@@ -261,10 +332,11 @@ class CheckpointManager:
     def clear_checkpoint(self, video_path: str) -> bool:
         """清除检查点（处理完成或用户主动清除）"""
         try:
-            checkpoint_file = self._get_checkpoint_file(video_path)
-            if checkpoint_file.exists():
-                checkpoint_file.unlink()
-                logger.info(f"检查点已清除: {os.path.basename(video_path)}")
+            with self._lock:
+                checkpoint_file = self._get_checkpoint_file(video_path)
+                if checkpoint_file.exists():
+                    checkpoint_file.unlink()
+                    logger.info(f"检查点已清除: {os.path.basename(video_path)}")
             return True
         except Exception as e:
             logger.error(f"清除检查点失败: {e}")

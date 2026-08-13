@@ -1,0 +1,20 @@
+include LICENSE
+include README.md
+include pyproject.toml
+include main.py
+recursive-include app *.py
+
+prune docs
+prune model
+prune scripts
+prune tests
+
+global-exclude *.py[cod]
+global-exclude __pycache__
+global-exclude .DS_Store
+global-exclude *.db
+global-exclude *.sqlite*
+global-exclude *.pt
+global-exclude *.pth
+global-exclude *.bin
+global-exclude *.safetensors

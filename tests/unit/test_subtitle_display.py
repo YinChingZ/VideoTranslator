@@ -5,21 +5,8 @@
 """
 
 import unittest
-import sys
-import os
-from unittest.mock import Mock, MagicMock, patch
-
-# 模拟PyQt5环境
-sys.modules['PyQt5'] = MagicMock()
-sys.modules['PyQt5.QtCore'] = MagicMock()
-sys.modules['PyQt5.QtWidgets'] = MagicMock()
-sys.modules['PyQt5.QtGui'] = MagicMock()
-sys.modules['PyQt5.QtMultimedia'] = MagicMock()
-sys.modules['PyQt5.QtMultimediaWidgets'] = MagicMock()
-sys.modules['cv2'] = MagicMock()
 
 from app.core.subtitle import SubtitleSegment, SubtitleProcessor
-from app.config import AppConfig
 
 
 class TestSubtitleDisplay(unittest.TestCase):

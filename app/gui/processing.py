@@ -1,26 +1,24 @@
-import os
 import logging
-import threading
+import os
 import time
-from typing import Dict, Any, List, Optional, Callable
+from typing import Any, Dict
 
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal, pyqtSlot
+from PyQt5.QtGui import QColor, QIcon, QTextCursor
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QProgressBar, 
-    QTextEdit, QScrollArea, QFrame, QSpacerItem, QSizePolicy
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QProgressBar,
+    QPushButton,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer, pyqtSlot, QObject, QThread
-from PyQt5.QtGui import QTextCursor, QIcon, QColor
 
-from app.core.video import VideoProcessor
-from app.core.audio import AudioProcessor
-from app.core.speech import SpeechRecognizer
-from app.core.translation import Translator
-from app.core.subtitle import SubtitleProcessor
-from app.utils.logger import add_log_viewer
-from app.utils.checkpoint import CheckpointManager
-from app.utils.exception_handler import ExceptionHandler, handle_exception, exception_handler, UserFriendlyError, ErrorCategory
-from app.utils.recovery_manager import retry, with_recovery, RetryConfig, RetryStrategy
 from app.gui.improved_processing import ImprovedProcessingWorker
+from app.utils.logger import add_log_viewer
+
 
 class ProcessingStage(QWidget):
     """处理阶段组件，显示单个处理步骤的状态"""
@@ -84,421 +82,6 @@ class ProcessingStage(QWidget):
         if progress is not None:
             self.progress_bar.setValue(progress)
 
-class ProcessingWorker(QObject):
-    """后台处理任务，发射信号到主线程更新UI"""
-    finished = pyqtSignal(dict)
-    error = pyqtSignal(str)
-    progress = pyqtSignal(int, str, int)  # stage, status, progress
-    log = pyqtSignal(str, int)
-
-    def __init__(self, video_path, source_language, target_language, config):
-        super().__init__()
-        self.video_path = video_path
-        self.source_language = source_language
-        self.target_language = target_language
-        self.config = config
-        self.video_processor = VideoProcessor()
-        self.audio_processor = AudioProcessor()
-        
-        # 延迟初始化以避免重复加载大模型
-        self.speech_recognizer = None
-        self.translator = None
-        self.subtitle_processor = SubtitleProcessor()
-        
-        # 断点续传管理器
-        self.checkpoint_manager = CheckpointManager()
-        
-        # 阶段映射
-        self.stage_map = {
-            'audio_extraction': 1,
-            'speech_recognition': 2, 
-            'text_translation': 3,
-            'subtitle_generation': 4
-        }
-
-    @with_recovery({'operation': 'video_processing'})
-    @pyqtSlot()
-    def run(self):
-        try:
-            # 检查是否可以断点续传
-            checkpoint = self.checkpoint_manager.load_checkpoint(self.video_path)
-            completed_stages = checkpoint.completed_stages if checkpoint else []
-            
-            self.log.emit(f'开始处理视频: {os.path.basename(self.video_path)}', logging.INFO)
-            if completed_stages:
-                self.log.emit(f'发现断点续传数据，已完成阶段: {completed_stages}', logging.INFO)
-            
-            audio_path = None
-            recog = None
-            trans = None
-            
-            # Stage 1: 音频提取（带重试机制）
-            if 'audio_extraction' not in completed_stages:
-                self.progress.emit(1, 'processing', 0)
-                self.log.emit('开始提取音频...', logging.INFO)
-                
-                @retry(max_attempts=3, delay=2.0, exceptions=(Exception,))
-                def extract_audio_with_retry():
-                    return self.audio_processor.extract_audio_from_video(
-                        self.video_path, format='wav', sample_rate=16000)
-                
-                try:
-                    audio_path = extract_audio_with_retry()
-                    if not audio_path:
-                        raise UserFriendlyError(
-                            "音频提取失败", 
-                            ErrorCategory.PROCESSING,
-                            user_message="无法从视频中提取音频，请检查视频文件是否完整",
-                            suggestions=[
-                                "确认视频文件完整且未损坏",
-                                "尝试使用其他视频格式",
-                                "检查FFmpeg是否正确安装",
-                                "确保有足够的磁盘空间"
-                            ]
-                        )
-                    
-                    # 保存检查点
-                    self.checkpoint_manager.save_checkpoint(
-                        self.video_path, 'audio_extraction', 
-                        {'audio_path': audio_path},
-                        source_language=self.source_language,
-                        target_language=self.target_language,
-                        whisper_model=self.config.get('whisper_model', 'base'),
-                        translation_provider=self.config.get('translation_provider', 'openai')
-                    )
-                    
-                    self.progress.emit(1, 'complete', 100)
-                    self.log.emit(f'音频提取完成: {audio_path}', logging.INFO)
-                except Exception as e:
-                    self.log.emit(f'音频提取失败: {str(e)}', logging.ERROR)
-                    if not isinstance(e, UserFriendlyError):
-                        # 将通用异常转换为用户友好的异常
-                        raise UserFriendlyError(
-                            f"音频提取失败: {str(e)}", 
-                            ErrorCategory.PROCESSING,
-                            user_message="音频提取过程中遇到问题",
-                            suggestions=[
-                                "检查视频文件是否损坏",
-                                "确认视频格式受支持",
-                                "重试操作",
-                                "联系技术支持"
-                            ]
-                        )
-                    raise
-            else:
-                # 从检查点恢复
-                stage_data = self.checkpoint_manager.get_stage_data(self.video_path, 'audio_extraction')
-                audio_path = stage_data.get('audio_path') if stage_data else None
-                if not audio_path or not os.path.exists(audio_path):
-                    raise UserFriendlyError(
-                        "检查点中的音频文件不存在", 
-                        ErrorCategory.FILE_SYSTEM,
-                        user_message="断点续传数据损坏，音频文件丢失",
-                        suggestions=[
-                            "重新开始处理",
-                            "检查磁盘空间",
-                            "确认文件未被删除"
-                        ]
-                    )
-                self.progress.emit(1, 'complete', 100)
-                self.log.emit(f'从检查点恢复音频文件: {audio_path}', logging.INFO)
-
-            # Stage 2: 语音识别（带重试机制）
-            if 'speech_recognition' not in completed_stages:
-                self.progress.emit(2, 'processing', 0)
-                self.log.emit('开始语音识别...', logging.INFO)
-                
-                @retry(max_attempts=2, delay=5.0, exceptions=(Exception,))
-                def transcribe_with_retry():
-                    # 延迟初始化语音识别器
-                    if self.speech_recognizer is None:
-                        model_name = self.config.get('whisper_model', 'base')
-                        self.speech_recognizer = SpeechRecognizer(model=model_name)
-                    
-                    lang = None if self.source_language=='auto' else self.source_language.split('-')[0]
-                    return self.speech_recognizer.transcribe(audio_path, language=lang)
-                
-                try:
-                    recog = transcribe_with_retry()
-                    if not recog:
-                        raise UserFriendlyError(
-                            "语音识别失败", 
-                            ErrorCategory.PROCESSING,
-                            user_message="无法识别音频中的语音内容",
-                            suggestions=[
-                                "确认音频质量清晰",
-                                "尝试选择正确的源语言",
-                                "检查Whisper模型是否可用",
-                                "尝试使用其他Whisper模型"
-                            ]
-                        )
-                    
-                    # 保存检查点
-                    self.checkpoint_manager.save_checkpoint(
-                        self.video_path, 'speech_recognition', 
-                        {'recognition_result': recog}
-                    )
-                    
-                    self.progress.emit(2, 'complete', 100)
-                    self.log.emit('语音识别完成', logging.INFO)
-                except Exception as e:
-                    self.log.emit(f'语音识别失败: {str(e)}', logging.ERROR)
-                    if not isinstance(e, UserFriendlyError):
-                        # 检查具体错误类型
-                        error_msg = str(e).lower()
-                        if 'memory' in error_msg or 'out of memory' in error_msg:
-                            raise UserFriendlyError(
-                                f"语音识别内存不足: {str(e)}", 
-                                ErrorCategory.MEMORY,
-                                user_message="系统内存不足，无法完成语音识别",
-                                suggestions=[
-                                    "关闭其他应用程序释放内存",
-                                    "使用较小的Whisper模型",
-                                    "将视频分段处理",
-                                    "增加系统内存"
-                                ]
-                            )
-                        elif 'model' in error_msg or 'load' in error_msg:
-                            raise UserFriendlyError(
-                                f"语音识别模型错误: {str(e)}", 
-                                ErrorCategory.DEPENDENCY,
-                                user_message="Whisper模型加载失败",
-                                suggestions=[
-                                    "检查网络连接",
-                                    "重新下载Whisper模型",
-                                    "尝试使用其他模型",
-                                    "检查磁盘空间"
-                                ]
-                            )
-                        else:
-                            raise UserFriendlyError(
-                                f"语音识别失败: {str(e)}", 
-                                ErrorCategory.PROCESSING,
-                                user_message="语音识别过程中遇到问题",
-                                suggestions=[
-                                    "重试操作",
-                                    "检查音频文件完整性",
-                                    "尝试其他设置",
-                                    "联系技术支持"
-                                ]
-                            )
-                    raise
-            else:
-                # 从检查点恢复
-                stage_data = self.checkpoint_manager.get_stage_data(self.video_path, 'speech_recognition')
-                recog = stage_data.get('recognition_result') if stage_data else None
-                if not recog:
-                    raise UserFriendlyError(
-                        "检查点中的语音识别结果不存在", 
-                        ErrorCategory.FILE_SYSTEM,
-                        user_message="断点续传数据损坏，语音识别结果丢失",
-                        suggestions=[
-                            "重新开始语音识别",
-                            "检查存储空间",
-                            "确认数据未被清理"
-                        ]
-                    )
-                self.progress.emit(2, 'complete', 100)
-                self.log.emit('从检查点恢复语音识别结果', logging.INFO)
-
-            # Stage 3: 文本翻译（带重试机制）
-            if 'text_translation' not in completed_stages:
-                self.progress.emit(3, 'processing', 0)
-                self.log.emit('开始翻译字幕...', logging.INFO)
-                
-                @retry(max_attempts=3, delay=3.0, backoff=1.5, 
-                      exceptions=(ConnectionError, TimeoutError, Exception))
-                def translate_with_retry():
-                    # 延迟初始化翻译器
-                    if self.translator is None:
-                        api_keys = self.config.get("api_keys", {})
-                        translation_provider = self.config.get('translation_provider', 'openai')
-                        self.translator = Translator(
-                            primary_service=translation_provider.lower(),
-                            api_keys=api_keys
-                        )
-                    
-                    texts = [seg['text'] for seg in recog['segments']]
-                    return self.translator.batch_translate(
-                        texts, 
-                        source_lang=recog.get('detected_language', self.source_language), 
-                        target_lang=self.target_language
-                    )
-                
-                try:
-                    trans = translate_with_retry()
-                    if not trans:
-                        raise UserFriendlyError(
-                            "字幕翻译失败", 
-                            ErrorCategory.API,
-                            user_message="翻译服务无法处理字幕内容",
-                            suggestions=[
-                                "检查网络连接",
-                                "验证API密钥是否有效",
-                                "尝试使用其他翻译服务",
-                                "检查API配额是否充足"
-                            ]
-                        )
-                    
-                    # 保存检查点
-                    self.checkpoint_manager.save_checkpoint(
-                        self.video_path, 'text_translation', 
-                        {'translation_result': [t.translated_text for t in trans]}
-                    )
-                    
-                    self.progress.emit(3, 'complete', 100)
-                    self.log.emit('字幕翻译完成', logging.INFO)
-                except Exception as e:
-                    self.log.emit(f'字幕翻译失败: {str(e)}', logging.ERROR)
-                    if not isinstance(e, UserFriendlyError):
-                        error_msg = str(e).lower()
-                        if any(keyword in error_msg for keyword in ['api', 'unauthorized', '401', '403']):
-                            if 'key' in error_msg or 'token' in error_msg or 'unauthorized' in error_msg:
-                                raise UserFriendlyError(
-                                    f"API密钥无效: {str(e)}", 
-                                    ErrorCategory.API,
-                                    user_message="翻译服务API密钥无效或已过期",
-                                    suggestions=[
-                                        "检查API密钥是否正确",
-                                        "确认API密钥未过期",
-                                        "重新配置API密钥",
-                                        "联系API服务提供商"
-                                    ]
-                                )
-                            elif 'quota' in error_msg or 'limit' in error_msg:
-                                raise UserFriendlyError(
-                                    f"API配额不足: {str(e)}", 
-                                    ErrorCategory.API,
-                                    user_message="翻译服务配额已用尽",
-                                    suggestions=[
-                                        "等待配额重置",
-                                        "升级API服务计划",
-                                        "使用其他翻译服务",
-                                        "分批处理内容"
-                                    ]
-                                )
-                            elif 'rate' in error_msg or 'too many' in error_msg:
-                                raise UserFriendlyError(
-                                    f"API调用过于频繁: {str(e)}", 
-                                    ErrorCategory.API,
-                                    user_message="API调用频率过高",
-                                    suggestions=[
-                                        "稍等几分钟后重试",
-                                        "减少并发请求",
-                                        "升级API服务计划"
-                                    ]
-                                )
-                        elif 'network' in error_msg or 'connection' in error_msg or 'timeout' in error_msg:
-                            raise UserFriendlyError(
-                                f"网络连接失败: {str(e)}", 
-                                ErrorCategory.NETWORK,
-                                user_message="无法连接到翻译服务",
-                                suggestions=[
-                                    "检查网络连接",
-                                    "尝试使用VPN",
-                                    "稍后重试",
-                                    "检查防火墙设置"
-                                ]
-                            )
-                        else:
-                            raise UserFriendlyError(
-                                f"翻译失败: {str(e)}", 
-                                ErrorCategory.PROCESSING,
-                                user_message="翻译过程中遇到问题",
-                                suggestions=[
-                                    "重试操作",
-                                    "检查源语言设置",
-                                    "尝试其他翻译服务",
-                                    "联系技术支持"
-                                ]
-                            )
-                    raise
-            else:
-                # 从检查点恢复
-                stage_data = self.checkpoint_manager.get_stage_data(self.video_path, 'text_translation')
-                translations = stage_data.get('translation_result') if stage_data else None
-                if not translations:
-                    raise UserFriendlyError(
-                        "检查点中的翻译结果不存在", 
-                        ErrorCategory.FILE_SYSTEM,
-                        user_message="断点续传数据损坏，翻译结果丢失",
-                        suggestions=[
-                            "重新开始翻译",
-                            "检查存储空间",
-                            "确认数据未被清理"
-                        ]
-                    )
-                # 重建翻译结果对象
-                from app.core.translation import TranslationResult
-                trans = [TranslationResult(
-                    translated_text=t, 
-                    original_text="", 
-                    source_lang=self.source_language, 
-                    target_lang=self.target_language
-                ) for t in translations]
-                self.progress.emit(3, 'complete', 100)
-                self.log.emit('从检查点恢复翻译结果', logging.INFO)
-
-            # Stage 4: 字幕生成
-            if 'subtitle_generation' not in completed_stages:
-                self.progress.emit(4, 'processing', 0)
-                self.log.emit('正在生成字幕文件...', logging.INFO)
-                try:
-                    # 合并识别和翻译结果
-                    for i, seg in enumerate(recog['segments']):
-                        seg['original'] = seg.get('text','')
-                        seg['translation'] = trans[i].translated_text if i < len(trans) else ''
-                    
-                    self.subtitle_processor.create_from_segments(recog['segments'])
-                    subtitle_path = self.subtitle_processor.save_to_file(
-                        os.path.splitext(self.video_path)[0]+'.srt', 
-                        format_type='srt', 
-                        include_original=True
-                    )
-                    if not subtitle_path:
-                        raise Exception('字幕生成失败')
-                    
-                    # 保存检查点
-                    self.checkpoint_manager.save_checkpoint(
-                        self.video_path, 'subtitle_generation', 
-                        {'subtitle_path': subtitle_path, 'segments': recog['segments']}
-                    )
-                    
-                    self.progress.emit(4, 'complete', 100)
-                    self.log.emit(f'字幕文件生成完成: {subtitle_path}', logging.INFO)
-                except Exception as e:
-                    self.log.emit(f'字幕生成失败: {str(e)}', logging.ERROR)
-                    raise
-            else:
-                # 从检查点恢复
-                stage_data = self.checkpoint_manager.get_stage_data(self.video_path, 'subtitle_generation')
-                subtitle_path = stage_data.get('subtitle_path') if stage_data else None
-                if stage_data and 'segments' in stage_data:
-                    recog['segments'] = stage_data['segments']
-                if not subtitle_path:
-                    raise Exception('检查点中的字幕文件不存在，需要重新生成')
-                self.progress.emit(4, 'complete', 100)
-                self.log.emit(f'从检查点恢复字幕文件: {subtitle_path}', logging.INFO)
-
-            # 处理完成，清除检查点
-            self.checkpoint_manager.clear_checkpoint(self.video_path)
-            
-            # 返回最终结果
-            result = {
-                'video_path': self.video_path,
-                'audio_path': audio_path,
-                'source_language': recog.get('detected_language', self.source_language),
-                'target_language': self.target_language,
-                'segments': recog['segments'],
-                'subtitle_path': subtitle_path
-            }
-            self.finished.emit(result)
-            
-        except Exception as e:
-            error_msg = f"处理失败: {str(e)}"
-            self.log.emit(error_msg, logging.ERROR)
-            self.error.emit(error_msg)
-
 class ProcessingWidget(QWidget):
     """处理状态显示界面"""
     
@@ -507,6 +90,9 @@ class ProcessingWidget(QWidget):
     
     # 信号：当处理出错时发出
     processing_error = pyqtSignal(str)
+
+    # 用户主动取消与失败分开，避免弹出“严重错误”。
+    processing_cancelled = pyqtSignal()
     
     # 信号：日志消息，用于线程安全更新日志区域
     log_signal = pyqtSignal(str, str)  
@@ -514,23 +100,28 @@ class ProcessingWidget(QWidget):
     def __init__(self, config: Dict[str, Any], parent=None):
         super().__init__(parent)
         self.config = config
-        self.processing_thread = None
         self.is_processing = False
         self.start_time = 0
         self.result_data = {}
-        
-        # 处理器实例
-        self.video_processor = VideoProcessor()
-        self.audio_processor = AudioProcessor()
-        self.speech_recognizer = None  # 延迟初始化
-        self.translator = None  # 延迟初始化
-        self.subtitle_processor = SubtitleProcessor()
+        self._thread = None
+        self._worker = None
         
         self.setup_ui()
         self.setup_connections()
         
         # 使用日志查看器并连接日志信号
-        add_log_viewer(self.append_log)
+        self._log_viewer_handler = add_log_viewer(self.append_log)
+        viewer_handler = self._log_viewer_handler
+
+        def detach_viewer(_object=None, handler=viewer_handler):
+            root_logger = logging.getLogger()
+            root_logger.removeHandler(handler)
+            handler.close()
+
+        # Parent-owned widgets are often destroyed without receiving their
+        # own closeEvent. Detach the root-logger callback at the QObject
+        # lifetime boundary so it cannot retain or call a deleted widget.
+        self.destroyed.connect(detach_viewer)
         # 线程安全将日志发射到 GUI 线程
         self.log_signal.connect(self._append_log_text)
     
@@ -609,8 +200,14 @@ class ProcessingWidget(QWidget):
         self.timer.timeout.connect(self.update_elapsed_time)
         self.timer.setInterval(1000)  # 每秒更新一次
     
-    def start_processing(self, video_path: str, source_language: str, target_language: str,
-                      whisper_model: str = "base", translation_provider: str = "OpenAI"):
+    def start_processing(
+        self,
+        video_path: str,
+        source_language: str,
+        target_language: str,
+        whisper_model: str | None = None,
+        translation_provider: str | None = None,
+    ):
         """
         开始处理视频
         
@@ -621,9 +218,29 @@ class ProcessingWidget(QWidget):
             whisper_model: Whisper模型类型
             translation_provider: 翻译服务提供商
         """
-        if self.is_processing:
+        if self.is_processing or (
+            self._thread is not None and self._thread.isRunning()
+        ):
             logging.warning("已有处理任务在进行中")
             return
+
+        getter = getattr(self.config, "get", None)
+
+        def config_value(key, default):
+            if callable(getter):
+                return getter(key, default)
+            return getattr(self.config, key, default)
+
+        worker_config = {
+            "whisper_model": whisper_model
+            or config_value("whisper_model", "base"),
+            "translation_provider": translation_provider
+            or config_value("translation_provider", "openai"),
+            # Copy secrets into this task snapshot. AppConfig intentionally
+            # keeps them in memory only; mutating settings later cannot alter
+            # a running task's provider credentials.
+            "api_keys": dict(config_value("api_keys", {}) or {}),
+        }
         
         self.is_processing = True
         self.start_time = time.time()
@@ -644,24 +261,38 @@ class ProcessingWidget(QWidget):
         # 这样避免重复加载 Whisper 模型和重复创建翻译器
         
         # 使用改进的处理工作器
-        self.thread = QThread(self)
-        self.worker = ImprovedProcessingWorker(video_path, source_language, target_language, self.config)
-        self.worker.moveToThread(self.thread)
+        thread = QThread(self)
+        worker = ImprovedProcessingWorker(
+            video_path,
+            source_language,
+            target_language,
+            worker_config,
+        )
+        self._thread = thread
+        self._worker = worker
+        worker.moveToThread(thread)
         
         # 连接信号
-        self.thread.started.connect(self.worker.run)
-        self.worker.finished.connect(self.on_processing_finished)
-        self.worker.error.connect(self.on_processing_error)
-        self.worker.progress.connect(self.handle_stage_progress)
-        self.worker.log.connect(self.append_log)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self.on_processing_finished)
+        worker.error.connect(self.on_processing_error)
+        worker.cancelled.connect(self.on_processing_cancelled)
+        worker.progress.connect(self.handle_stage_progress)
+        worker.log.connect(self.append_log)
         
         # 清理连接
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.error.connect(self.thread.quit)
-        self.thread.finished.connect(self.worker.cleanup)
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(worker.deleteLater)
+        worker.cancelled.connect(worker.deleteLater)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        thread.finished.connect(
+            lambda: self._on_thread_finished(thread, worker)
+        )
         
         # 启动线程
-        self.thread.start()
+        thread.start()
     
     def handle_stage_progress(self, stage: int, status: str, progress: int):
         if stage == 1:
@@ -674,12 +305,29 @@ class ProcessingWidget(QWidget):
             self.subtitle_stage.set_status(status, progress)
 
     def on_processing_finished(self, result):
+        self.timer.stop()
+        self.status_label.setText("处理完成")
         self.processing_completed.emit(result)
-        self.is_processing = False
 
     def on_processing_error(self, msg):
+        self.timer.stop()
+        self.status_label.setText("处理失败")
         self.processing_error.emit(msg)
-        self.is_processing = False
+
+    def on_processing_cancelled(self):
+        self.timer.stop()
+        self.status_label.setText("处理已取消，可稍后继续")
+        self.append_log("处理已安全取消，恢复点已保留", logging.WARNING)
+        self.processing_cancelled.emit()
+
+    def _on_thread_finished(self, thread, worker):
+        """在后台线程退出后安全释放 Qt 对象。"""
+        if self._worker is worker:
+            self._worker = None
+        if self._thread is thread:
+            self._thread = None
+            self.is_processing = False
+        thread.deleteLater()
 
     def cancel_processing(self):
         """取消处理过程"""
@@ -689,30 +337,20 @@ class ProcessingWidget(QWidget):
         self.append_log("用户取消处理")
         
         # 取消改进的处理器
-        if hasattr(self.worker, 'cancel'):
-            self.worker.cancel()
-        
-        # 强制停止线程
-        if hasattr(self, 'thread') and self.thread.isRunning():
-            self.thread.requestInterruption()
-            self.thread.quit()
-            self.thread.wait(3000)  # 等待3秒
-            if self.thread.isRunning():
-                self.thread.terminate()  # 强制终止
-        
-        # 标记为非处理状态
-        self.is_processing = False
-        # 停止定时器在主线程执行
-        QTimer.singleShot(0, self.timer.stop)
-        
-        # 发出错误信号通知取消
-        self.processing_error.emit("用户取消处理")
+        self.cancel_btn.setEnabled(False)
+        self.status_label.setText("正在安全停止当前阶段...")
+        if self._worker is not None:
+            # Update the UI first: injected/test workers may emit the terminal
+            # signal synchronously from cancel().
+            self._worker.cancel()
+        # 不强杀 QThread：底层阶段会在安全边界发出 cancelled 信号。
     
     def reset_ui(self):
         """重置界面状态"""
         self.log_text.clear()
         self.status_label.setText("准备处理...")
         self.time_label.setText("预计剩余时间: 计算中...")
+        self.cancel_btn.setEnabled(True)
     
     def update_elapsed_time(self):
         """更新已用时间和预计剩余时间"""
@@ -724,13 +362,11 @@ class ProcessingWidget(QWidget):
         
         # 简单估计总时间和剩余时间
         # 这里使用一个非常简单的估计方法，根据各阶段的完成情况
-        completed_stages = 0
         total_progress = 0
         
         for stage in [self.extraction_stage, self.recognition_stage, 
                     self.translation_stage, self.subtitle_stage]:
             if stage.status == "complete":
-                completed_stages += 1
                 total_progress += 100
             elif stage.status == "processing":
                 total_progress += stage.progress_bar.value()
@@ -772,7 +408,25 @@ class ProcessingWidget(QWidget):
             color = "#8B0000"  # 深红色
         
         # 发射日志到主线程显示
-        self.log_signal.emit(message, color)
+        try:
+            self.log_signal.emit(message, color)
+        except RuntimeError:
+            # A queued root-logger record may race with Qt object teardown.
+            # The handler is removed on destruction; silently discard the
+            # last record instead of recursively emitting a logging error.
+            pass
+
+    def closeEvent(self, event):
+        self._remove_log_viewer()
+        super().closeEvent(event)
+
+    def _remove_log_viewer(self):
+        handler = getattr(self, "_log_viewer_handler", None)
+        if handler is None:
+            return
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+        self._log_viewer_handler = None
     
     @pyqtSlot(str, str)
     def _append_log_text(self, message: str, color: str):

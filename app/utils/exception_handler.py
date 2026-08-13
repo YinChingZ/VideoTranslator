@@ -5,13 +5,14 @@
 提供用户友好的错误提示和解决建议
 """
 
+import logging
 import sys
 import traceback
-import logging
-from typing import Dict, Any, Optional, Callable, Type
 from enum import Enum
-from PyQt5.QtWidgets import QMessageBox, QWidget
+from typing import Dict, Optional
+
 from PyQt5.QtCore import QObject, pyqtSignal
+from PyQt5.QtWidgets import QMessageBox, QWidget
 
 logger = logging.getLogger(__name__)
 

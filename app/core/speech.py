@@ -1,25 +1,40 @@
-import os
-import sys
-import logging
-import time
-import json
 import gc
-from typing import Dict, List, Tuple, Optional, Union, Any, Callable
-from pathlib import Path
+import inspect
+import json
+import logging
+import os
+import tempfile
 import threading
+import time
+from typing import Any, Callable, Dict, Optional, Union
 
-import numpy as np
-import importlib.util
-# Explicitly load local Whisper package to ensure correct module is imported
-root_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-pkg_init = os.path.join(root_dir, 'model', 'whisper', 'whisper', '__init__.py')
-spec = importlib.util.spec_from_file_location('whisper', pkg_init)
-whisper = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(whisper)
+try:
+    # ``openai-whisper`` exposes the top-level ``whisper`` package.  Do not
+    # load a vendored source tree by path: clean installations do not contain
+    # one, and doing so made importing this module fail before the application
+    # could show a useful dependency error.
+    import whisper
+except ImportError as exc:  # pragma: no cover - depends on host environment
+    whisper = None
+    _WHISPER_IMPORT_ERROR = exc
+else:
+    _WHISPER_IMPORT_ERROR = None
 
-import torch
+try:
+    import torch
+except ImportError as exc:  # pragma: no cover - depends on host environment
+    torch = None
+    _TORCH_IMPORT_ERROR = exc
+else:
+    _TORCH_IMPORT_ERROR = None
 
 from app.utils.memory_manager import MemoryMonitor, memory_managed_operation
+from app.utils.paths import (
+    ensure_private_directory,
+    get_transcription_cache_dir,
+    get_whisper_model_dir,
+)
+
 
 class SpeechRecognizer:
     """处理语音识别的类，使用OpenAI的Whisper模型"""
@@ -43,7 +58,7 @@ class SpeechRecognizer:
         
         # 确定设备（如果未指定）
         if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            device = "cuda" if self._cuda_available() else "cpu"
         self.device = device
         
         # 确定计算类型
@@ -54,27 +69,55 @@ class SpeechRecognizer:
         
         self.model = None  # 延迟加载模型
         logging.info(f"初始化语音识别器: 模型={model}, 设备={device}, 计算类型={compute_type}")
+
+    @staticmethod
+    def _cuda_available() -> bool:
+        """Return whether CUDA is available without requiring torch at import time."""
+        return bool(torch is not None and torch.cuda.is_available())
+
+    @staticmethod
+    def _ensure_dependencies() -> None:
+        """Raise an actionable error when speech dependencies are unavailable."""
+        missing = []
+        if whisper is None:
+            missing.append("openai-whisper")
+        if torch is None:
+            missing.append("torch")
+
+        if missing:
+            details = []
+            if _WHISPER_IMPORT_ERROR is not None:
+                details.append(f"whisper: {_WHISPER_IMPORT_ERROR}")
+            if _TORCH_IMPORT_ERROR is not None:
+                details.append(f"torch: {_TORCH_IMPORT_ERROR}")
+            detail_text = f" ({'; '.join(details)})" if details else ""
+            raise RuntimeError(
+                "Whisper 语音识别依赖不可用。请安装 "
+                f"{', '.join(missing)}（例如运行 `pip install openai-whisper torch`）"
+                f"{detail_text}"
+            )
     
     def load_model(self):
         """加载Whisper模型"""
         if self.model is not None:
             return
+
+        self._ensure_dependencies()
             
         try:
             logging.info(f"正在加载Whisper模型: {self.model_name}")
             load_start = time.time()
             
-            # 定义本地模型文件路径
-            models_dir = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 
-                "model", "whisper", "models"
-            )
-            os.makedirs(models_dir, exist_ok=True)
+            # Wheels and application bundles may be installed read-only.
+            # Whisper models therefore live in a platform cache, never beside
+            # the source package.  An environment override supports managed
+            # or large-volume model stores.
+            models_dir = ensure_private_directory(get_whisper_model_dir())
             
             self.model = whisper.load_model(
                 self.model_name,
                 device=self.device,
-                download_root=models_dir
+                download_root=str(models_dir),
             )
             
             load_time = time.time() - load_start
@@ -135,34 +178,47 @@ class SpeechRecognizer:
                 
                 # 创建自定义进度回调
                 if progress_callback:
-                    original_callback = self.model.transcribe.__kwdefaults__.get('progress_callback', None)
+                    progress_callback(0)
+                    try:
+                        parameters = inspect.signature(self.model.transcribe).parameters
+                    except (TypeError, ValueError):
+                        parameters = {}
+
+                    # Upstream openai-whisper currently has no progress
+                    # callback argument.  Some compatible backends do, so use
+                    # it only when explicitly supported instead of passing an
+                    # unknown decoding option to upstream Whisper.
+                    if "progress_callback" in parameters:
+                        original_callback = getattr(
+                            self.model.transcribe, "__kwdefaults__", None
+                        ) or {}
+                        original_callback = original_callback.get("progress_callback")
                     
-                    def wrapped_progress(progress: Union[float, dict]):
-                        # 检查取消标志
-                        if self.cancel_flag:
-                            return True  # 返回True意味着取消转写
-                        
-                        # 转换进度格式
-                        if isinstance(progress, float):
-                            percent = int(progress * 100)
-                        elif isinstance(progress, dict) and 'progress' in progress:
-                            percent = int(progress['progress'] * 100)
-                        else:
-                            percent = 0
-                        
-                        # 调用用户提供的回调
-                        progress_callback(percent)
-                        
-                        # 如果有原始回调，也调用它
-                        if original_callback:
-                            original_callback(progress)
-                            
-                        return False  # 继续转写
-                    
-                    options["progress_callback"] = wrapped_progress
+                        def wrapped_progress(progress: Union[float, dict]):
+                            if self.cancel_flag:
+                                return True
+
+                            if isinstance(progress, float):
+                                percent = int(progress * 100)
+                            elif isinstance(progress, dict) and 'progress' in progress:
+                                percent = int(progress['progress'] * 100)
+                            else:
+                                percent = 0
+
+                            progress_callback(percent)
+                            if original_callback:
+                                original_callback(progress)
+                            return False
+
+                        options["progress_callback"] = wrapped_progress
                 
                 # 执行转写
                 result = self.model.transcribe(audio_path, **options)
+
+                if self.cancel_flag:
+                    raise InterruptedError("语音识别已取消")
+                if progress_callback:
+                    progress_callback(100)
                 
                 transcribe_time = time.time() - transcribe_start
                 logging.info(f"音频转写完成，用时: {transcribe_time:.2f}秒")
@@ -177,7 +233,7 @@ class SpeechRecognizer:
                 
                 # 强制垃圾回收
                 gc.collect()
-                if torch.cuda.is_available():
+                if self._cuda_available():
                     torch.cuda.empty_cache()
                 
                 return output
@@ -185,7 +241,7 @@ class SpeechRecognizer:
             except Exception as e:
                 # 出错时也要清理内存
                 gc.collect()
-                if torch.cuda.is_available():
+                if self._cuda_available():
                     torch.cuda.empty_cache()
                 logging.error(f"转写音频失败: {str(e)}")
                 raise
@@ -207,8 +263,10 @@ class SpeechRecognizer:
         """
         try:
             import ffmpeg
-            import tempfile
-            
+
+            if segment_length <= 0:
+                raise ValueError("segment_length 必须大于 0")
+
             # 加载模型（如果尚未加载）
             self.load_model()
             
@@ -230,68 +288,66 @@ class SpeechRecognizer:
             all_segments = []
             detected_language = None
             
-            temp_dir = tempfile.gettempdir()
-            
-            for i in range(num_segments):
-                if self.cancel_flag:
-                    logging.info("处理被用户取消")
-                    break
-                
-                start_time = i * segment_length
-                
-                # 最后一段的实际长度可能更短
-                actual_segment_length = min(segment_length, duration - start_time)
-                
-                # 创建临时音频段文件
-                segment_path = os.path.join(temp_dir, f"segment_{i}_{os.path.basename(audio_path)}")
-                
-                try:
+            # Each invocation owns its directory.  The former global names
+            # (``/tmp/segment_0_<basename>``) collided when two jobs processed
+            # files with the same name, and a crash could leave audio behind.
+            with tempfile.TemporaryDirectory(
+                prefix="video-translator-segments-"
+            ) as temp_dir:
+                for i in range(num_segments):
+                    if self.cancel_flag:
+                        logging.info("处理被用户取消")
+                        raise InterruptedError("语音识别已取消")
+
+                    start_time = i * segment_length
+
+                    # 最后一段的实际长度可能更短
+                    actual_segment_length = min(segment_length, duration - start_time)
+
+                    # A deterministic WAV container avoids relying on the
+                    # source extension for FFmpeg output format selection.
+                    segment_path = os.path.join(temp_dir, f"segment_{i}.wav")
+
                     # 分割音频
                     (
                         ffmpeg
                         .input(audio_path, ss=start_time, t=actual_segment_length)
-                        .output(segment_path)
+                        .output(segment_path, acodec="pcm_s16le", ac=1, ar=16000)
                         .run(quiet=True, overwrite_output=True)
                     )
-                    
+
                     # 设置段落回调
                     segment_progress_callback = None
                     if progress_callback:
-                        def segment_callback(p):
+                        def segment_callback(p, segment_index=i):
                             # 将单个段进度转换为整体进度
-                            overall_progress = int((i / num_segments + p / 100 / num_segments) * 100)
+                            overall_progress = int(
+                                (segment_index / num_segments + p / 100 / num_segments) * 100
+                            )
                             progress_callback(overall_progress)
-                        
+
                         segment_progress_callback = segment_callback
-                    
+
                     # 处理该段落
                     logging.info(f"处理片段 {i+1}/{num_segments} (开始于 {start_time:.2f}s)")
                     result = self.transcribe(
-                        segment_path, 
+                        segment_path,
                         language=(detected_language or language),
                         progress_callback=segment_progress_callback
                     )
-                    
+
                     # 如果是第一段，记录检测到的语言
                     if i == 0 and not language:
                         detected_language = result.get("detected_language")
                         logging.info(f"检测到语言: {detected_language}")
-                    
+
                     # 调整段落时间戳
                     for segment in result["segments"]:
                         segment["start"] += start_time
                         segment["end"] += start_time
-                    
+
                     # 添加到结果中
                     all_segments.extend(result["segments"])
-                    
-                finally:
-                    # 清理临时文件
-                    if os.path.exists(segment_path):
-                        try:
-                            os.remove(segment_path)
-                        except Exception:
-                            pass
             
             # 合并结果
             return {
@@ -360,7 +416,7 @@ class SpeechRecognizer:
             # 移除模型引用，让Python的垃圾回收器释放内存
             self.model = None
             # 尝试释放CUDA内存（如果使用GPU）
-            if self.device == "cuda":
+            if self.device == "cuda" and self._cuda_available():
                 torch.cuda.empty_cache()
             logging.info("已卸载Whisper模型")
     
@@ -385,7 +441,7 @@ class SpeechRecognizer:
         # 简单示例：确保每个句子以标点符号结束
         for i, segment in enumerate(segments):
             text = segment["text"].strip()
-            if text and not text[-1] in ['.', '?', '!', '。', '？', '！']:
+            if text and text[-1] not in ['.', '?', '!', '。', '？', '！']:
                 # 如果是句子中间部分，添加逗号，否则添加句号
                 if i < len(segments)-1 and len(text) < 50:
                     segments[i]["text"] = text + ','
@@ -409,16 +465,40 @@ class SpeechRecognizer:
         """
         try:
             # 为缓存文件构建路径
-            cache_dir = os.path.join(os.path.expanduser("~"), ".videotranslator", "cache")
-            os.makedirs(cache_dir, exist_ok=True)
+            cache_dir = ensure_private_directory(get_transcription_cache_dir())
             
             # 使用音频文件的哈希作为缓存文件名
             audio_hash = self._file_hash(audio_path)
-            cache_path = os.path.join(cache_dir, f"{audio_hash}_{self.model_name}.json")
+            cache_path = cache_dir / f"{audio_hash}_{self.model_name}.json"
             
-            # 保存结果
-            with open(cache_path, 'w', encoding='utf-8') as f:
-                json.dump(result, f, ensure_ascii=False, indent=2)
+            # Write beside the destination and atomically replace it.  A
+            # serialization error, crash, or power loss must not destroy a
+            # previously valid transcription cache entry.
+            descriptor, temp_name = tempfile.mkstemp(
+                prefix=f".{cache_path.name}.",
+                suffix=".tmp",
+                dir=cache_dir,
+            )
+            try:
+                with os.fdopen(descriptor, 'w', encoding='utf-8') as f:
+                    json.dump(result, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                try:
+                    os.chmod(temp_name, 0o600)
+                except OSError:
+                    pass
+                os.replace(temp_name, cache_path)
+            except Exception:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(temp_name)
+                except OSError:
+                    pass
+                raise
             
             logging.info(f"识别结果已缓存: {cache_path}")
             return True
@@ -439,16 +519,16 @@ class SpeechRecognizer:
         """
         try:
             # 构建缓存文件路径
-            cache_dir = os.path.join(os.path.expanduser("~"), ".videotranslator", "cache")
+            cache_dir = get_transcription_cache_dir()
             audio_hash = self._file_hash(audio_path)
-            cache_path = os.path.join(cache_dir, f"{audio_hash}_{self.model_name}.json")
+            cache_path = cache_dir / f"{audio_hash}_{self.model_name}.json"
             
             # 检查缓存是否存在
-            if not os.path.exists(cache_path):
+            if not cache_path.exists():
                 return None
                 
             # 读取缓存
-            with open(cache_path, 'r', encoding='utf-8') as f:
+            with cache_path.open('r', encoding='utf-8') as f:
                 result = json.load(f)
             
             logging.info(f"使用缓存的识别结果: {cache_path}")

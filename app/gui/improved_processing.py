@@ -1,455 +1,549 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Improved processing worker with better thread management and timeout handling.
-改进的处理器，具有更好的线程管理和超时处理机制。
-"""
+"""Background worker for the four-stage video translation pipeline."""
 
-import os
-import time
+from __future__ import annotations
+
 import logging
+import os
+import tempfile
 import threading
-from typing import Optional, Dict, Any
-from PyQt5.QtCore import QObject, pyqtSignal, QTimer, QThread
-from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
+import time
+import uuid
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
 
-from app.core.video import VideoProcessor
+from PyQt5.QtCore import QObject, pyqtSignal
+
 from app.core.audio import AudioProcessor
 from app.core.speech import SpeechRecognizer
-from app.core.translation import Translator
 from app.core.subtitle import SubtitleProcessor
-from app.utils.logger import setup_logger
-
-logger = setup_logger()
-from app.utils.checkpoint import CheckpointManager
-from app.utils.exception_handler import UserFriendlyError, ErrorCategory
-from app.utils.recovery_manager import retry
+from app.core.translation import Translator
+from app.utils.checkpoint import CheckpointManager, ProcessingCheckpoint
+from app.utils.exception_handler import ErrorCategory, UserFriendlyError
 
 logger = logging.getLogger(__name__)
 
 
 class ImprovedProcessingWorker(QObject):
-    """改进的处理工作器，具有更好的线程管理和超时控制"""
-    
+    """Run extraction, recognition, translation and subtitle generation.
+
+    The worker itself is moved to one ``QThread`` by :class:`ProcessingWidget`.
+    Long-running stages therefore execute directly instead of being wrapped in
+    another executor that Python cannot safely terminate.
+    """
+
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
-    progress = pyqtSignal(int, str, int)  # stage, status, progress
+    cancelled = pyqtSignal()
+    progress = pyqtSignal(int, str, int)  # stage number, state, percentage
     log = pyqtSignal(str, int)
-    
-    def __init__(self, video_path, source_language, target_language, config):
+
+    STAGES = (
+        "audio_extraction",
+        "speech_recognition",
+        "text_translation",
+        "subtitle_generation",
+    )
+
+    def __init__(
+        self,
+        video_path: str,
+        source_language: str,
+        target_language: str,
+        config: Mapping[str, Any] | Any,
+        *,
+        audio_processor: AudioProcessor | None = None,
+        speech_recognizer: SpeechRecognizer | None = None,
+        translator: Translator | None = None,
+        subtitle_processor: SubtitleProcessor | None = None,
+        checkpoint_manager: CheckpointManager | None = None,
+    ) -> None:
         super().__init__()
-        self.video_path = video_path
+        self.video_path = str(Path(video_path).expanduser().resolve())
         self.source_language = source_language
         self.target_language = target_language
-        self.config = config
-        
-        # 取消标志
+        self.config = self._snapshot_config(config)
+
         self.cancel_requested = threading.Event()
-        
-        # 处理器实例
-        self.video_processor = VideoProcessor()
-        self.audio_processor = AudioProcessor()
-        self.speech_recognizer = None  # 延迟初始化
-        self.translator = None  # 延迟初始化
-        self.subtitle_processor = SubtitleProcessor()
-        
-        # 断点续传管理器
-        self.checkpoint_manager = CheckpointManager()
-        
-        # 线程池
-        self.executor = ThreadPoolExecutor(max_workers=2)
-        
-        # 阶段超时设置（秒）
+        self.audio_processor = audio_processor or AudioProcessor()
+        self.speech_recognizer = speech_recognizer
+        self.translator = translator
+        self.subtitle_processor = subtitle_processor or SubtitleProcessor()
+        self.checkpoint_manager = checkpoint_manager or CheckpointManager()
+
+        # These are observability budgets, not unsafe hard timeouts. FFmpeg and
+        # Whisper cannot be force-stopped by cancelling a Python Future.
         self.stage_timeouts = {
-            'audio_extraction': 300,  # 5分钟
-            'speech_recognition': 1800,  # 30分钟
-            'text_translation': 600,  # 10分钟
-            'subtitle_generation': 60  # 1分钟
+            "audio_extraction": 300,
+            "speech_recognition": 1800,
+            "text_translation": 600,
+            "subtitle_generation": 60,
         }
-    
+
+    @staticmethod
+    def _snapshot_config(config: Mapping[str, Any] | Any) -> dict[str, Any]:
+        """Take a task-local copy so settings cannot change halfway through."""
+
+        def value(key: str, default: Any) -> Any:
+            getter = getattr(config, "get", None)
+            if callable(getter):
+                return getter(key, default)
+            return getattr(config, key, default)
+
+        raw_keys = value("api_keys", {}) or {}
+        api_keys = {
+            str(provider).strip().lower(): str(key)
+            for provider, key in dict(raw_keys).items()
+            if key is not None
+        }
+        return {
+            "whisper_model": str(value("whisper_model", "base")).strip().lower(),
+            "translation_provider": str(
+                value("translation_provider", "openai")
+            ).strip().lower(),
+            "api_keys": api_keys,
+        }
+
+    @property
+    def processing_settings(self) -> dict[str, str]:
+        """Settings that define checkpoint compatibility for every stage."""
+
+        return {
+            "source_language": self.source_language,
+            "target_language": self.target_language,
+            "whisper_model": self.config["whisper_model"],
+            "translation_provider": self.config["translation_provider"],
+        }
+
     def is_cancelled(self) -> bool:
-        """检查是否已请求取消"""
         return self.cancel_requested.is_set()
-    
-    def cancel(self):
-        """请求取消处理"""
+
+    def cancel(self) -> None:
+        """Request cooperative cancellation from any thread."""
+
         self.cancel_requested.set()
-        if self.executor:
-            self.executor.shutdown(wait=False)
-        
-        # 如果语音识别器正在运行，也取消它
-        if self.speech_recognizer:
-            self.speech_recognizer.cancel_flag = True
-    
-    def cleanup(self):
-        """清理资源"""
+        recognizer = self.speech_recognizer
+        if recognizer is not None:
+            try:
+                recognizer.cancel()
+            except Exception as exc:  # cancellation must remain best effort
+                logger.warning("请求语音识别器停止时出错: %s", exc)
+
+    def cleanup(self) -> None:
+        close_translator = getattr(self.translator, "close", None)
+        if callable(close_translator):
+            try:
+                close_translator()
+            except Exception as exc:
+                logger.warning("关闭翻译缓存时出错: %s", exc)
         try:
-            if self.executor:
-                self.executor.shutdown(wait=True)
-            if self.audio_processor:
-                self.audio_processor.cleanup()
-        except Exception as e:
-            logger.warning(f"清理资源时出错: {e}")
-    
-    def run_stage_with_timeout(self, stage_name: str, stage_func, *args, **kwargs):
-        """在指定超时时间内运行阶段任务"""
-        timeout = self.stage_timeouts.get(stage_name, 600)
-        
-        def target():
-            return stage_func(*args, **kwargs)
-        
-        future = self.executor.submit(target)
-        
-        try:
-            # 等待结果，带超时
-            result = future.result(timeout=timeout)
-            return result
-        except TimeoutError:
-            future.cancel()
-            raise UserFriendlyError(
-                f"{stage_name} 超时",
-                ErrorCategory.PROCESSING,
-                user_message=f"处理阶段 '{stage_name}' 超时，请尝试重新处理",
-                suggestions=[
-                    "检查系统性能",
-                    "尝试使用更快的处理设置",
-                    "分段处理较长的视频",
-                    "重启应用程序"
-                ]
-            )
-        except Exception as e:
-            future.cancel()
-            raise e
-    
-    def extract_audio_stage(self, video_path: str) -> str:
-        """音频提取阶段"""
+            self.audio_processor.cleanup()
+        except Exception as exc:
+            logger.warning("清理音频资源时出错: %s", exc)
+
+    def run_stage_with_timeout(
+        self, stage_name: str, stage_func: Any, *args: Any, **kwargs: Any
+    ) -> Any:
+        """Run one stage and check cancellation at both safe boundaries."""
+
         if self.is_cancelled():
             raise InterruptedError("用户取消操作")
-        
-        self.log.emit('开始提取音频...', logging.INFO)
-        self.progress.emit(1, 'processing', 10)
-        
-        def extract_audio():
-            if self.is_cancelled():
-                raise InterruptedError("用户取消操作")
-            return self.audio_processor.extract_audio_from_video(
-                video_path, format='wav', sample_rate=16000
+        started_at = time.monotonic()
+        result = stage_func(*args, **kwargs)
+        elapsed = time.monotonic() - started_at
+        budget = self.stage_timeouts.get(stage_name)
+        if budget and elapsed > budget:
+            logger.warning(
+                "处理阶段 %s 用时 %.1f 秒，超过建议预算 %s 秒",
+                stage_name,
+                elapsed,
+                budget,
             )
-        
-        audio_path = self.run_stage_with_timeout('audio_extraction', extract_audio)
-        
-        if not audio_path or not os.path.exists(audio_path):
+        if self.is_cancelled():
+            raise InterruptedError("用户取消操作")
+        return result
+
+    def _save_checkpoint(self, stage: str, stage_data: dict[str, Any]) -> None:
+        """Save every stage with the exact same compatibility fingerprint."""
+
+        saved = self.checkpoint_manager.save_checkpoint(
+            self.video_path,
+            stage,
+            stage_data,
+            **self.processing_settings,
+        )
+        if not saved:
+            self.log.emit("无法保存恢复点；本次处理仍将继续", logging.WARNING)
+
+    @staticmethod
+    def _valid_recognition_result(result: Any) -> bool:
+        if not isinstance(result, dict):
+            return False
+        segments = result.get("segments")
+        if not isinstance(segments, list) or not segments:
+            return False
+        for segment in segments:
+            if not isinstance(segment, dict) or not isinstance(segment.get("text"), str):
+                return False
+            try:
+                start = float(segment["start"])
+                end = float(segment["end"])
+            except (KeyError, TypeError, ValueError):
+                return False
+            if start < 0 or end < start:
+                return False
+        return True
+
+    @classmethod
+    def _valid_translation_result(cls, result: Any, recognition_result: Any) -> bool:
+        if not isinstance(result, dict) or not cls._valid_recognition_result(recognition_result):
+            return False
+        source_segments = recognition_result["segments"]
+        original_segments = result.get("original_segments")
+        translations = result.get("translated_texts")
+        services = result.get("services")
+        if not all(isinstance(value, list) for value in (original_segments, translations, services)):
+            return False
+        expected_length = len(source_segments)
+        if not (
+            len(original_segments) == len(translations) == len(services) == expected_length
+        ):
+            return False
+        for segment, translated, service in zip(source_segments, translations, services):
+            if not isinstance(translated, str) or not isinstance(service, str):
+                return False
+            if segment.get("text", "").strip() and not translated.strip():
+                return False
+            if service.lower() in {"fallback", "emergency_fallback"}:
+                return False
+        return True
+
+    def _checkpoint_stage_is_valid(
+        self,
+        stage: str,
+        data: Any,
+        restored: dict[str, dict[str, Any]],
+    ) -> bool:
+        if not isinstance(data, dict):
+            return False
+        if stage == "audio_extraction":
+            path = data.get("audio_path")
+            return isinstance(path, str) and os.path.isfile(path)
+        if stage == "speech_recognition":
+            return self._valid_recognition_result(data.get("recognition_result"))
+        if stage == "text_translation":
+            recognition = restored.get("speech_recognition", {}).get(
+                "recognition_result"
+            )
+            return self._valid_translation_result(data.get("translation_result"), recognition)
+        if stage == "subtitle_generation":
+            path = data.get("subtitle_path")
+            return isinstance(path, str) and os.path.isfile(path)
+        return False
+
+    def _validated_resume_data(
+        self, checkpoint: ProcessingCheckpoint | None
+    ) -> dict[str, dict[str, Any]]:
+        """Return only a valid, contiguous stage prefix from one loaded snapshot."""
+
+        if checkpoint is None:
+            return {}
+
+        completed = set(checkpoint.completed_stages)
+        restored: dict[str, dict[str, Any]] = {}
+        for stage in self.STAGES:
+            if stage not in completed:
+                break
+            stage_data = checkpoint.stage_data.get(stage)
+            if not self._checkpoint_stage_is_valid(stage, stage_data, restored):
+                break
+            restored[stage] = stage_data
+
+        if set(restored) != completed or len(restored) != len(checkpoint.completed_stages):
+            self.log.emit("恢复点不完整，已保留有效阶段并重建后续数据", logging.WARNING)
+            self.checkpoint_manager.clear_checkpoint(self.video_path)
+            for stage in self.STAGES:
+                if stage in restored:
+                    self._save_checkpoint(stage, restored[stage])
+        return restored
+
+    def extract_audio_stage(self, video_path: str) -> str:
+        self.log.emit("开始提取音频...", logging.INFO)
+        self.progress.emit(1, "processing", 10)
+
+        audio_path = self.run_stage_with_timeout(
+            "audio_extraction",
+            self.audio_processor.extract_audio_from_video,
+            video_path,
+            format="wav",
+            sample_rate=16000,
+        )
+        if not audio_path or not os.path.isfile(audio_path):
             raise UserFriendlyError(
                 "音频提取失败",
                 ErrorCategory.PROCESSING,
                 user_message="无法从视频中提取音频",
-                suggestions=[
-                    "检查视频文件完整性",
-                    "确认视频格式受支持",
-                    "检查磁盘空间",
-                    "尝试其他视频文件"
-                ]
+                suggestions=["检查视频完整性和格式", "检查磁盘空间与 FFmpeg 安装"],
             )
-        
-        # 保存检查点
-        self.checkpoint_manager.save_checkpoint(
-            video_path, 'audio_extraction',
-            {'audio_path': str(audio_path)},
-            source_language=self.source_language,
-            target_language=self.target_language,
-            whisper_model=self.config.get('whisper_model', 'base'),
-            translation_provider=self.config.get('translation_provider', 'openai')
+
+        path = os.fspath(audio_path)
+        self._save_checkpoint("audio_extraction", {"audio_path": path})
+        self.progress.emit(1, "complete", 100)
+        self.log.emit(f"音频提取完成: {os.path.basename(path)}", logging.INFO)
+        return path
+
+    def speech_recognition_stage(self, audio_path: str) -> dict[str, Any]:
+        self.log.emit("开始语音识别...", logging.INFO)
+        self.progress.emit(2, "processing", 10)
+
+        if self.speech_recognizer is None:
+            self.speech_recognizer = SpeechRecognizer(model=self.config["whisper_model"])
+        language = (
+            None
+            if self.source_language.lower() == "auto"
+            else self.source_language.split("-")[0]
         )
-        
-        self.progress.emit(1, 'complete', 100)
-        self.log.emit(f'音频提取完成: {os.path.basename(audio_path)}', logging.INFO)
-        return str(audio_path)
-    
-    def speech_recognition_stage(self, audio_path: str) -> dict:
-        """语音识别阶段"""
-        if self.is_cancelled():
-            raise InterruptedError("用户取消操作")
-        
-        self.log.emit('开始语音识别...', logging.INFO)
-        self.progress.emit(2, 'processing', 10)
-        
-        # 延迟初始化语音识别器
-        if not self.speech_recognizer:
-            model_name = self.config.get('whisper_model', 'base')
-            self.speech_recognizer = SpeechRecognizer(model=model_name)
-        
-        def transcribe():
-            if self.is_cancelled():
-                raise InterruptedError("用户取消操作")
-            
-            lang = None if self.source_language == 'auto' else self.source_language.split('-')[0]
-            return self.speech_recognizer.transcribe(audio_path, language=lang)
-        
-        result = self.run_stage_with_timeout('speech_recognition', transcribe)
-        
-        if not result:
+        result = self.run_stage_with_timeout(
+            "speech_recognition",
+            self.speech_recognizer.transcribe,
+            audio_path,
+            language=language,
+        )
+        if not self._valid_recognition_result(result):
             raise UserFriendlyError(
                 "语音识别失败",
                 ErrorCategory.PROCESSING,
-                user_message="无法识别音频中的语音内容",
-                suggestions=[
-                    "检查音频质量",
-                    "尝试选择正确的源语言",
-                    "使用更大的Whisper模型",
-                    "确认音频包含语音内容"
-                ]
+                user_message="没有识别到带有效时间轴的语音片段",
+                suggestions=["检查音频是否包含清晰语音", "确认源语言或更换 Whisper 模型"],
             )
-        
-        # 保存检查点
-        self.checkpoint_manager.save_checkpoint(
-            self.video_path, 'speech_recognition',
-            {'recognition_result': result}
-        )
-        
-        self.progress.emit(2, 'complete', 100)
-        self.log.emit(f'语音识别完成，识别到 {len(result.get("segments", []))} 个片段', logging.INFO)
+
+        self._save_checkpoint("speech_recognition", {"recognition_result": result})
+        self.progress.emit(2, "complete", 100)
+        self.log.emit(f"语音识别完成，共 {len(result['segments'])} 个片段", logging.INFO)
         return result
-    
-    def translation_stage(self, recognition_result: dict) -> dict:
-        """翻译阶段"""
-        if self.is_cancelled():
-            raise InterruptedError("用户取消操作")
-        
-        self.log.emit('开始翻译...', logging.INFO)
-        self.progress.emit(3, 'processing', 10)
-        
-        # 延迟初始化翻译器
-        if not self.translator:
-            api_keys = self.config.get("api_keys", {})
-            translation_provider = self.config.get('translation_provider', 'openai')
-            self.translator = Translator(
-                primary_service=translation_provider.lower(),
-                api_keys=api_keys
+
+    def translation_stage(self, recognition_result: dict[str, Any]) -> dict[str, Any]:
+        self.log.emit("开始翻译...", logging.INFO)
+        self.progress.emit(3, "processing", 10)
+        if not self._valid_recognition_result(recognition_result):
+            raise UserFriendlyError(
+                "没有文本可翻译",
+                ErrorCategory.PROCESSING,
+                user_message="语音识别结果无效，无法开始翻译",
             )
-        
-        def translate():
+
+        if self.translator is None:
+            self.translator = Translator(
+                primary_service=self.config["translation_provider"],
+                api_keys=self.config["api_keys"],
+            )
+
+        original_segments = recognition_result["segments"]
+        translated_texts: list[str] = []
+        services: list[str] = []
+        for index, segment in enumerate(original_segments):
             if self.is_cancelled():
                 raise InterruptedError("用户取消操作")
-            
-            # 提取文本进行翻译
-            texts = [segment.get('text', '') for segment in recognition_result.get('segments', [])]
-            if not texts:
-                raise UserFriendlyError(
-                    "没有文本可翻译",
-                    ErrorCategory.PROCESSING,
-                    user_message="语音识别结果中没有找到文本内容"
+            text = segment["text"]
+            if text.strip():
+                translated = self.translator.translate(
+                    text,
+                    source_lang=self.source_language,
+                    target_lang=self.target_language,
                 )
-            
-            # 批量翻译
-            translated_texts = []
-            for i, text in enumerate(texts):
+                metadata = getattr(translated, "metadata", None) or {}
+                translated_text = getattr(translated, "translated_text", "")
+                service = str(getattr(translated, "service", ""))
+                if (
+                    translated is None
+                    or metadata.get("success") is not True
+                    or not isinstance(translated_text, str)
+                    or not translated_text.strip()
+                    or service.lower() in {"fallback", "emergency_fallback"}
+                ):
+                    provider = self.config["translation_provider"]
+                    raise UserFriendlyError(
+                        "翻译服务不可用",
+                        ErrorCategory.API,
+                        user_message=f"{provider} 未返回有效译文，原文不会被伪装成译文。",
+                        suggestions=["配置有效的 API 密钥", "检查网络、服务状态和调用配额"],
+                    )
+                translated_texts.append(translated_text)
+                services.append(service)
+            else:
+                translated_texts.append("")
+                services.append("passthrough")
+            percent = int((index + 1) / len(original_segments) * 80) + 10
+            self.progress.emit(3, "processing", percent)
+
+        result = {
+            "original_segments": original_segments,
+            "translated_texts": translated_texts,
+            "services": services,
+        }
+        self._save_checkpoint("text_translation", {"translation_result": result})
+        self.progress.emit(3, "complete", 100)
+        self.log.emit("翻译完成", logging.INFO)
+        return result
+
+    def subtitle_generation_stage(self, translation_result: dict[str, Any]) -> str:
+        self.log.emit("开始生成字幕...", logging.INFO)
+        self.progress.emit(4, "processing", 10)
+
+        recognition = {"segments": translation_result.get("original_segments", [])}
+        if not self._valid_translation_result(translation_result, recognition):
+            raise UserFriendlyError(
+                "字幕数据不完整",
+                ErrorCategory.PROCESSING,
+                user_message="翻译片段与识别时间轴无法一一对应",
+            )
+
+        def generate_subtitles() -> str:
+            subtitle_segments = []
+            for segment, translated_text in zip(
+                translation_result["original_segments"],
+                translation_result["translated_texts"],
+            ):
                 if self.is_cancelled():
                     raise InterruptedError("用户取消操作")
-                
-                if text.strip():
-                    translated = self.translator.translate(
-                        text, 
-                        source_lang=self.source_language,
-                        target_lang=self.target_language
-                    )
-                    translated_texts.append(translated.translated_text if translated else text)
-                else:
-                    translated_texts.append(text)
-                
-                # 更新进度
-                progress = int((i + 1) / len(texts) * 80) + 10
-                self.progress.emit(3, 'processing', progress)
-            
-            # 构建翻译结果
-            translation_result = {
-                'original_segments': recognition_result.get('segments', []),
-                'translated_texts': translated_texts
-            }
-            
-            return translation_result
-        
-        result = self.run_stage_with_timeout('text_translation', translate)
-        
-        # 保存检查点
-        self.checkpoint_manager.save_checkpoint(
-            self.video_path, 'text_translation',
-            {'translation_result': result}
-        )
-        
-        self.progress.emit(3, 'complete', 100)
-        self.log.emit('翻译完成', logging.INFO)
+                subtitle_segments.append(
+                    {
+                        "start": segment["start"],
+                        "end": segment["end"],
+                        "original_text": segment["text"],
+                        "translated_text": translated_text,
+                    }
+                )
+
+            self.subtitle_processor.create_from_segments(subtitle_segments)
+            video_name = Path(self.video_path).stem
+            output_path = os.path.join(
+                tempfile.gettempdir(),
+                f"{video_name}_{uuid.uuid4().hex}_subtitles.srt",
+            )
+            saved_path = self.subtitle_processor.save_to_file(
+                output_path,
+                format_type="srt",
+                language_mode="translation_only",
+            )
+            return os.fspath(saved_path)
+
+        result = self.run_stage_with_timeout("subtitle_generation", generate_subtitles)
+        if not isinstance(result, str) or not os.path.isfile(result):
+            raise UserFriendlyError(
+                "字幕生成失败",
+                ErrorCategory.PROCESSING,
+                user_message="字幕文件未能写入磁盘",
+            )
+
+        self._save_checkpoint("subtitle_generation", {"subtitle_path": result})
+        self.progress.emit(4, "complete", 100)
+        self.log.emit(f"字幕生成完成: {os.path.basename(result)}", logging.INFO)
         return result
-    
-    def subtitle_generation_stage(self, translation_result: dict) -> str:
-        """字幕生成阶段"""
-        import tempfile
-        import os
-        
-        if self.is_cancelled():
-            raise InterruptedError("用户取消操作")
-        
-        self.log.emit('开始生成字幕...', logging.INFO)
-        self.progress.emit(4, 'processing', 10)
-        
-        def generate_subtitles():
+
+    @staticmethod
+    def _error_text(error: UserFriendlyError) -> str:
+        message = error.user_message
+        if error.suggestions:
+            message += "\n\n建议：\n" + "\n".join(f"• {item}" for item in error.suggestions)
+        return message
+
+    def run(self) -> None:
+        """Execute the pipeline and emit exactly one terminal signal."""
+
+        terminal: tuple[str, Any]
+        try:
+            self.log.emit(f"开始处理视频: {os.path.basename(self.video_path)}", logging.INFO)
             if self.is_cancelled():
                 raise InterruptedError("用户取消操作")
-            
-            # 生成字幕文件
-            original_segments = translation_result.get('original_segments', [])
-            translated_texts = translation_result.get('translated_texts', [])
-            
-            # 创建字幕段
-            subtitle_segments = []
-            for i, (segment, translated_text) in enumerate(zip(original_segments, translated_texts)):
-                subtitle_segments.append({
-                    'start': segment.get('start', 0),
-                    'end': segment.get('end', 0),
-                    'text': translated_text
-                })
-            
-            # 先创建字幕段，然后保存到文件
-            self.subtitle_processor.create_from_segments(subtitle_segments)
-            
-            # 生成输出文件路径
-            import tempfile
-            import os
-            video_name = os.path.splitext(os.path.basename(self.video_path))[0]
-            subtitle_path = os.path.join(tempfile.gettempdir(), f"{video_name}_subtitles.srt")
-            
-            # 保存字幕文件
-            saved_path = self.subtitle_processor.save_to_file(subtitle_path, format_type='srt')
-            return saved_path
-        
-        result = self.run_stage_with_timeout('subtitle_generation', generate_subtitles)
-        
-        # 确保result是字符串路径
-        if isinstance(result, list):
-            # 如果result是列表，可能是create_from_segments的返回值被意外返回
-            # 重新生成字幕文件
-            import tempfile
-            import os
-            video_name = os.path.splitext(os.path.basename(self.video_path))[0]
-            subtitle_path = os.path.join(tempfile.gettempdir(), f"{video_name}_subtitles.srt")
-            result = self.subtitle_processor.save_to_file(subtitle_path, format_type='srt')
-            logger.warning(f"字幕生成阶段返回了列表，已重新生成字幕文件: {result}")
-        
-        # 保存检查点
-        self.checkpoint_manager.save_checkpoint(
-            self.video_path, 'subtitle_generation',
-            {'subtitle_path': str(result)}
-        )
-        
-        self.progress.emit(4, 'complete', 100)
-        self.log.emit(f'字幕生成完成: {os.path.basename(result)}', logging.INFO)
-        return str(result)
-    
-    def run(self):
-        """主处理函数"""
-        try:
-            self.log.emit(f'开始处理视频: {os.path.basename(self.video_path)}', logging.INFO)
-            
-            # 检查断点续传
-            checkpoint = self.checkpoint_manager.load_checkpoint(self.video_path)
-            completed_stages = checkpoint.completed_stages if checkpoint else []
-            
-            if completed_stages:
-                self.log.emit(f'发现断点续传数据，已完成阶段: {completed_stages}', logging.INFO)
-            
-            # 初始化结果变量
-            audio_path = None
-            recognition_result = None
-            translation_result = None
-            subtitle_path = None
-            
-            # 阶段1：音频提取
-            if 'audio_extraction' not in completed_stages:
+
+            checkpoint = self.checkpoint_manager.load_checkpoint(
+                self.video_path,
+                **self.processing_settings,
+            )
+            restored = self._validated_resume_data(checkpoint)
+            if restored:
+                self.log.emit(
+                    f"发现有效恢复点: {list(restored)}",
+                    logging.INFO,
+                )
+
+            if "audio_extraction" in restored:
+                audio_path = restored["audio_extraction"]["audio_path"]
+                self.progress.emit(1, "complete", 100)
+            else:
                 audio_path = self.extract_audio_stage(self.video_path)
-            else:
-                # 从检查点恢复
-                stage_data = self.checkpoint_manager.get_stage_data(self.video_path, 'audio_extraction')
-                audio_path = stage_data.get('audio_path') if stage_data else None
-                self.progress.emit(1, 'complete', 100)
-                self.log.emit(f'从检查点恢复音频文件: {os.path.basename(audio_path)}', logging.INFO)
-            
+
             if self.is_cancelled():
-                return
-            
-            # 阶段2：语音识别
-            if 'speech_recognition' not in completed_stages:
+                raise InterruptedError("用户取消操作")
+            if "speech_recognition" in restored:
+                recognition_result = restored["speech_recognition"]["recognition_result"]
+                self.progress.emit(2, "complete", 100)
+            else:
                 recognition_result = self.speech_recognition_stage(audio_path)
-            else:
-                # 从检查点恢复
-                stage_data = self.checkpoint_manager.get_stage_data(self.video_path, 'speech_recognition')
-                recognition_result = stage_data.get('recognition_result') if stage_data else None
-                self.progress.emit(2, 'complete', 100)
-                self.log.emit('从检查点恢复语音识别结果', logging.INFO)
-            
+
             if self.is_cancelled():
-                return
-            
-            # 阶段3：翻译
-            if 'text_translation' not in completed_stages:
+                raise InterruptedError("用户取消操作")
+            if "text_translation" in restored:
+                translation_result = restored["text_translation"]["translation_result"]
+                self.progress.emit(3, "complete", 100)
+            else:
                 translation_result = self.translation_stage(recognition_result)
-            else:
-                # 从检查点恢复
-                stage_data = self.checkpoint_manager.get_stage_data(self.video_path, 'text_translation')
-                translation_result = stage_data.get('translation_result') if stage_data else None
-                self.progress.emit(3, 'complete', 100)
-                self.log.emit('从检查点恢复翻译结果', logging.INFO)
-            
+
             if self.is_cancelled():
-                return
-            
-            # 阶段4：字幕生成
-            if 'subtitle_generation' not in completed_stages:
-                subtitle_path = self.subtitle_generation_stage(translation_result)
+                raise InterruptedError("用户取消操作")
+            if "subtitle_generation" in restored:
+                subtitle_path = restored["subtitle_generation"]["subtitle_path"]
+                self.progress.emit(4, "complete", 100)
             else:
-                # 从检查点恢复
-                stage_data = self.checkpoint_manager.get_stage_data(self.video_path, 'subtitle_generation')
-                subtitle_path = stage_data.get('subtitle_path') if stage_data else None
-                self.progress.emit(4, 'complete', 100)
-                self.log.emit(f'从检查点恢复字幕文件: {os.path.basename(subtitle_path)}', logging.INFO)
-            
-            # 构建最终结果
-            # 确保包含segments数据供字幕编辑器使用
-            segments_data = []
-            if recognition_result and 'segments' in recognition_result:
-                original_segments = recognition_result['segments']
-                translated_texts = translation_result.get('translated_texts', []) if translation_result else []
-                
-                # 组合原始段和翻译文本
-                for i, segment in enumerate(original_segments):
-                    translated_text = translated_texts[i] if i < len(translated_texts) else ''
-                    segments_data.append({
-                        'start': segment.get('start', 0),
-                        'end': segment.get('end', 0),
-                        'original_text': segment.get('text', ''),
-                        'translated_text': translated_text
-                    })
-            
-            final_result = {
-                'video_path': self.video_path,
-                'audio_path': audio_path,
-                'recognition_result': recognition_result,
-                'translation_result': translation_result,
-                'subtitle_path': subtitle_path,
-                'segments': segments_data,  # 添加segments数据
-                'status': 'completed'
+                subtitle_path = self.subtitle_generation_stage(translation_result)
+
+            segments = [
+                {
+                    "start": segment["start"],
+                    "end": segment["end"],
+                    "original_text": segment["text"],
+                    "translated_text": translated,
+                }
+                for segment, translated in zip(
+                    recognition_result["segments"],
+                    translation_result["translated_texts"],
+                )
+            ]
+            result = {
+                "video_path": self.video_path,
+                "audio_path": audio_path,
+                "recognition_result": recognition_result,
+                "translation_result": translation_result,
+                "subtitle_path": subtitle_path,
+                "segments": segments,
+                "status": "completed",
             }
-            
-            self.log.emit('所有处理阶段完成！', logging.INFO)
-            self.finished.emit(final_result)
-            
+            if not self.checkpoint_manager.clear_checkpoint(self.video_path):
+                self.log.emit("处理完成，但旧恢复点未能清除", logging.WARNING)
+            self.log.emit("所有处理阶段完成！", logging.INFO)
+            terminal = ("finished", result)
         except InterruptedError:
-            self.log.emit('处理已被用户取消', logging.WARNING)
-            self.error.emit('处理已取消')
-        except UserFriendlyError as e:
-            self.log.emit(f'处理失败: {e.message}', logging.ERROR)
-            self.error.emit(str(e))
-        except Exception as e:
+            self.log.emit("处理已被用户取消", logging.WARNING)
+            terminal = ("cancelled", None)
+        except UserFriendlyError as exc:
+            message = self._error_text(exc)
+            self.log.emit(f"处理失败: {message}", logging.ERROR)
+            terminal = ("error", message)
+        except Exception as exc:
             logger.exception("处理过程中发生未知错误")
-            self.log.emit(f'处理失败: {str(e)}', logging.ERROR)
-            self.error.emit(f'处理失败: {str(e)}')
+            message = f"处理失败: {exc}"
+            self.log.emit(message, logging.ERROR)
+            terminal = ("error", message)
         finally:
+            # Never tell the GUI that the thread is terminal before owned
+            # resources have actually been released.
             self.cleanup()
+
+        kind, payload = terminal
+        if kind == "finished":
+            self.finished.emit(payload)
+        elif kind == "cancelled":
+            self.cancelled.emit()
+        else:
+            self.error.emit(payload)

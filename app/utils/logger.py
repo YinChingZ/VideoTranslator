@@ -5,24 +5,28 @@ Enhanced logging system for VideoTranslator
 优化的日志系统，支持敏感信息过滤和性能监控
 """
 
-import os
 import logging
-import sys
-import zipfile
-from logging.handlers import RotatingFileHandler
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Optional, Callable, Dict, Any
-import time
 import re
+import sys
 import threading
+import time
+import traceback
+from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Callable, Dict, Optional
+
+from app.utils.paths import ensure_private_directory, get_state_dir
 
 # 日志格式
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
 # 敏感信息模式，用于过滤API密钥等
 SENSITIVE_PATTERNS = [
-    r'(api[_-]?key|token|password|secret|credential)["\s:=]+["\w\-]+',
+    r'["\']?(api[_-]?key|token|password|secret|credential)["\']?\s*[:=]\s*["\']?[A-Za-z0-9\-._~+/=]+',
+    # Google Translation and some compatible APIs use a ``key`` query
+    # parameter. Requests exceptions may include the fully prepared URL.
+    r'(?<=[?&])key=[^&\s]+',
     r'Bearer\s+[A-Za-z0-9\-._~+/]+=*',
     r'sk-[A-Za-z0-9]{32,}',  # OpenAI API keys
     r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',  # UUID tokens
@@ -42,7 +46,9 @@ class SensitiveInfoFilter(logging.Filter):
             record.msg = self._redact_sensitive_info(record.msg)
         
         # 处理args中可能的敏感信息
-        if record.args:
+        if isinstance(record.args, dict):
+            record.args = self._redact_dict(record.args)
+        elif record.args:
             args_list = []
             for arg in record.args:
                 if isinstance(arg, str):
@@ -52,6 +58,16 @@ class SensitiveInfoFilter(logging.Filter):
                 else:
                     args_list.append(arg)
             record.args = tuple(args_list)
+
+        # Formatter renders tracebacks separately from ``record.msg``. Redact
+        # prepared request URLs there as well (notably Google's ``?key=...``).
+        if record.exc_info:
+            exception_text = "".join(traceback.format_exception(*record.exc_info))
+            record.exc_text = self._redact_sensitive_info(exception_text).rstrip()
+        elif record.exc_text:
+            record.exc_text = self._redact_sensitive_info(record.exc_text)
+        if record.stack_info:
+            record.stack_info = self._redact_sensitive_info(record.stack_info)
         
         return True
     
@@ -65,7 +81,11 @@ class SensitiveInfoFilter(logging.Filter):
         """移除字典中的敏感信息"""
         redacted = {}
         for key, value in data.items():
-            if any(keyword in key.lower() for keyword in ['key', 'token', 'password', 'secret']):
+            key_text = str(key)
+            if any(
+                keyword in key_text.lower()
+                for keyword in ['key', 'token', 'password', 'secret']
+            ):
                 redacted[key] = self.replacement
             elif isinstance(value, str):
                 redacted[key] = self._redact_sensitive_info(value)
@@ -133,8 +153,7 @@ class LogViewerHandler(logging.Handler):
 
 def get_log_path() -> Path:
     """确定日志文件存储位置"""
-    log_dir = Path.home() / ".videotranslator" / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = ensure_private_directory(get_state_dir() / "logs")
     
     # 使用日期作为日志文件名
     date_str = datetime.now().strftime('%Y-%m-%d')
@@ -165,24 +184,36 @@ def setup_logger(level: int = logging.INFO, log_file: Optional[str] = None) -> l
     console_handler.setLevel(level)
     console_handler.setFormatter(logging.Formatter(LOG_FORMAT))
     logger.addHandler(console_handler)
-    
-    # 创建文件处理器
-    if log_file is None:
-        log_file = get_log_path()
-    
-    file_handler = RotatingFileHandler(
-        log_file, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8'
-    )
-    file_handler.setLevel(level)
-    file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
-    logger.addHandler(file_handler)
-    
-    # 添加敏感信息过滤器
+
+    # Filtering must be active before any fallback warning is emitted.  A
+    # logging failure should never become an application-startup failure: the
+    # health checker can explain an unwritable state directory only after the
+    # logger has been configured.
     sensitive_filter = SensitiveInfoFilter()
     console_handler.addFilter(sensitive_filter)
-    file_handler.addFilter(sensitive_filter)
     
-    logger.info(f"日志系统初始化完成，日志文件: {log_file}")
+    # 创建文件处理器
+    try:
+        if log_file is None:
+            log_file = get_log_path()
+        else:
+            log_path = Path(log_file).expanduser()
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_file = log_path
+
+        file_handler = RotatingFileHandler(
+            log_file, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8'
+        )
+    except (OSError, PermissionError) as exc:
+        # Console logging is sufficient to keep the GUI usable.  Do not retry
+        # in the source tree or another surprising location.
+        logger.warning("无法启用文件日志，仅使用控制台: %s", exc)
+    else:
+        file_handler.setLevel(level)
+        file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        file_handler.addFilter(sensitive_filter)
+        logger.addHandler(file_handler)
+        logger.info("日志系统初始化完成，日志文件: %s", log_file)
     return logger
 
 
@@ -216,7 +247,7 @@ def cleanup_old_logs(days: int = 7) -> None:
     Args:
         days: 保留多少天的日志文件
     """
-    log_dir = Path.home() / ".videotranslator" / "logs"
+    log_dir = get_state_dir() / "logs"
     if not log_dir.exists():
         return
     

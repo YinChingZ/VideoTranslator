@@ -1,10 +1,10 @@
 """
 自定义GUI控件模块，包含项目中使用的特殊控件
 """
-from PyQt5.QtWidgets import (QWidget, QPushButton, QSlider, QLabel, 
-                             QLineEdit, QTextEdit, QVBoxLayout, QHBoxLayout)
-from PyQt5.QtCore import Qt, pyqtSignal, QRectF, QPoint, QSize
-from PyQt5.QtGui import QPainter, QPen, QColor, QBrush, QFont
+from PyQt5.QtCore import QPoint, QRectF, QSize, Qt, pyqtSignal
+from PyQt5.QtGui import QBrush, QColor, QPainter, QPalette, QPen
+from PyQt5.QtWidgets import QLineEdit, QTextEdit, QWidget
+
 
 class TimestampEdit(QLineEdit):
     """时间戳编辑控件"""
@@ -68,13 +68,8 @@ class TimelineWidget(QWidget):
         
         # 设置最小高度
         self.setMinimumHeight(50)
-        
-        # 颜色定义
-        self.bg_color = QColor(40, 40, 40)
-        self.timeline_color = QColor(100, 100, 100)
-        self.segment_color = QColor(80, 120, 200, 180)
-        self.selected_segment_color = QColor(120, 180, 255)
-        self.position_color = QColor(255, 50, 50)
+        self.setAccessibleName("字幕时间轴")
+        self.setToolTip("点击或拖动以定位视频；点击色块以选择字幕片段")
         
         self.setMouseTracking(True)
     
@@ -107,9 +102,23 @@ class TimelineWidget(QWidget):
         """绘制时间轴和字幕段落"""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+
+        # Follow the active Qt palette so light/dark/system themes remain
+        # readable.  Highlight is the semantic selection color; position uses
+        # BrightText/Error-like red only when it contrasts with the base.
+        palette = self.palette()
+        bg_color = palette.color(QPalette.Base)
+        timeline_color = palette.color(QPalette.Mid)
+        text_color = palette.color(QPalette.Text)
+        segment_color = palette.color(QPalette.Highlight)
+        segment_color.setAlpha(170)
+        selected_segment_color = palette.color(QPalette.Highlight).lighter(125)
+        position_color = QColor("#d32f2f")
+        if bg_color.lightness() < 80:
+            position_color = QColor("#ff6b6b")
         
         # 绘制背景
-        painter.fillRect(event.rect(), self.bg_color)
+        painter.fillRect(event.rect(), bg_color)
         
         width = self.width()
         height = self.height()
@@ -120,7 +129,7 @@ class TimelineWidget(QWidget):
         
         # 绘制时间轴基线
         timeline_y = height // 2
-        painter.setPen(QPen(self.timeline_color, 1))
+        painter.setPen(QPen(timeline_color, 1))
         painter.drawLine(margin, timeline_y, width - margin, timeline_y)
         
         # 如果没有持续时间，不继续绘制
@@ -136,9 +145,9 @@ class TimelineWidget(QWidget):
             
             # 选择颜色
             if i == self.selected_segment:
-                painter.setBrush(QBrush(self.selected_segment_color))
+                painter.setBrush(QBrush(selected_segment_color))
             else:
-                painter.setBrush(QBrush(self.segment_color))
+                painter.setBrush(QBrush(segment_color))
             
             # 绘制段落矩形
             segment_height = height * 0.4
@@ -148,19 +157,21 @@ class TimelineWidget(QWidget):
             
             # 绘制段落索引
             if segment_width > 15:  # 只有当足够宽才显示索引
-                painter.setPen(QColor(255, 255, 255))
-                painter.setFont(QFont("Arial", 8))
+                painter.setPen(palette.color(QPalette.HighlightedText))
+                font = self.font()
+                font.setPointSize(max(7, font.pointSize() - 2))
+                painter.setFont(font)
                 painter.drawText(QRectF(start_x, segment_top, segment_width, segment_height), 
                                 Qt.AlignCenter, str(i + 1))
         
         # 绘制当前位置指示器
         position_x = margin + (self.position / self.duration) * inner_width
         
-        painter.setPen(QPen(self.position_color, 2))
+        painter.setPen(QPen(position_color, 2))
         painter.drawLine(int(position_x), 5, int(position_x), height - 5)
         
         # 绘制位置指示器顶部的小三角形
-        painter.setBrush(QBrush(self.position_color))
+        painter.setBrush(QBrush(position_color))
         painter.setPen(Qt.NoPen)
         
         triangle_size = 8
@@ -172,8 +183,10 @@ class TimelineWidget(QWidget):
         painter.drawPolygon(triangle)
         
         # 绘制时间标记
-        painter.setPen(QColor(200, 200, 200))
-        painter.setFont(QFont("Arial", 7))
+        painter.setPen(text_color)
+        font = self.font()
+        font.setPointSize(max(7, font.pointSize() - 2))
+        painter.setFont(font)
         
         time_interval = self._calculate_time_interval()
         current_time = 0
@@ -194,8 +207,6 @@ class TimelineWidget(QWidget):
     def _calculate_time_interval(self):
         """根据总时长计算合适的时间标记间隔"""
         # 希望在时间轴上标记5-10个时间点
-        target_marks = 8
-        
         if self.duration <= 30:
             return 5  # 5秒间隔
         elif self.duration <= 60:
@@ -215,7 +226,7 @@ class TimelineWidget(QWidget):
             x_pos = event.x()
             width = self.width()
             margin = 10
-            inner_width = width - 2 * margin
+            inner_width = max(1, width - 2 * margin)
             
             # 检查是否点击了字幕段落
             clicked_segment = -1
@@ -246,7 +257,7 @@ class TimelineWidget(QWidget):
             x_pos = event.x()
             width = self.width()
             margin = 10
-            inner_width = width - 2 * margin
+            inner_width = max(1, width - 2 * margin)
             
             relative_pos = (x_pos - margin) / inner_width
             new_position = relative_pos * self.duration
@@ -274,11 +285,8 @@ class WaveformView(QWidget):
         
         # 设置最小高度
         self.setMinimumHeight(80)
-        
-        # 颜色定义
-        self.bg_color = QColor(30, 30, 30)
-        self.waveform_color = QColor(100, 180, 100)
-        self.position_color = QColor(255, 50, 50)
+        self.setAccessibleName("音频波形")
+        self.setToolTip("点击或拖动波形以定位播放时间")
         
         self.setMouseTracking(True)
     
@@ -305,16 +313,23 @@ class WaveformView(QWidget):
         """绘制波形"""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+
+        palette = self.palette()
+        bg_color = palette.color(QPalette.Base)
+        waveform_color = palette.color(QPalette.Highlight)
+        position_color = QColor("#d32f2f")
+        if bg_color.lightness() < 80:
+            position_color = QColor("#ff6b6b")
         
         # 绘制背景
-        painter.fillRect(event.rect(), self.bg_color)
+        painter.fillRect(event.rect(), bg_color)
         
         width = self.width()
         height = self.height()
         
         # 如果有波形数据，绘制波形
         if self.waveform_data and self.duration > 0:
-            painter.setPen(QPen(self.waveform_color, 1))
+            painter.setPen(QPen(waveform_color, 1))
             
             # 为简化实现，这里假设waveform_data是一个振幅值数组
             # 实际使用中应替换为实际的波形数据处理
@@ -334,22 +349,22 @@ class WaveformView(QWidget):
                 painter.drawLine(int(x1), int(center_y + amp1), int(x2), int(center_y + amp2))
         else:
             # 如果没有波形数据，绘制一个提示文本
-            painter.setPen(QColor(150, 150, 150))
-            painter.setFont(QFont("Arial", 10))
+            painter.setPen(palette.color(QPalette.PlaceholderText))
+            painter.setFont(self.font())
             painter.drawText(event.rect(), Qt.AlignCenter, "波形数据未加载")
         
         # 绘制当前位置指示器
         if self.duration > 0:
             position_x = (self.position / self.duration) * width
             
-            painter.setPen(QPen(self.position_color, 2))
+            painter.setPen(QPen(position_color, 2))
             painter.drawLine(int(position_x), 0, int(position_x), height)
     
     def mousePressEvent(self, event):
         """处理鼠标点击事件"""
         if event.button() == Qt.LeftButton:
             x_pos = event.x()
-            width = self.width()
+            width = max(1, self.width())
             
             # 计算对应的时间位置
             relative_pos = x_pos / width
@@ -363,7 +378,7 @@ class WaveformView(QWidget):
         if event.buttons() & Qt.LeftButton:
             # 如果是拖动，更新位置
             x_pos = event.x()
-            width = self.width()
+            width = max(1, self.width())
             
             # 计算对应的时间位置
             relative_pos = x_pos / width

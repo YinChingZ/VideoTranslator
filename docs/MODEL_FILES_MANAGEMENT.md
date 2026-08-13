@@ -1,260 +1,68 @@
-# Whisper 模型文件管理策略
+# Whisper 模型文件管理
 
-## 📋 概述
+VideoTranslator 不在 Git 仓库或安装包中分发 Whisper 权重。首次使用某个模型时，
+`openai-whisper` 会下载权重到应用的用户可写缓存；后续启动复用同一文件。这样既
+避免数 GB 文件污染 Git 历史，也允许应用安装在只读位置。
 
-OpenAI Whisper 模型文件通常较大，需要特殊的管理策略来处理 Git 仓库。本文档详细说明了如何处理这些模型文件。
+## 存储位置
 
-## 📊 模型文件大小
+应用通过 `app.utils.paths.get_whisper_model_dir()` 选择目录，优先级如下：
 
-| 模型 | 大小 | 参数量 | 质量 | 速度 |
-|------|------|--------|------|------|
-| tiny | ~39 MB | 39 M | 最低 | 最快 |
-| base | ~142 MB | 74 M | 较低 | 快 |
-| small | ~466 MB | 244 M | 中等 | 中等 |
-| medium | ~1.5 GB | 769 M | 较高 | 慢 |
-| large | ~2.9 GB | 1550 M | 最高 | 最慢 |
+1. `VIDEOTRANSLATOR_MODEL_DIR` 指定的完整目录；
+2. 应用缓存目录下的 `whisper/`。
 
-## 🎯 当前策略
+应用缓存目录为：
 
-### .gitignore 配置
+| 平台 | 默认目录 |
+| --- | --- |
+| Linux | `${XDG_CACHE_HOME:-~/.cache}/video-translator` |
+| macOS | `~/Library/Caches/VideoTranslator` |
+| Windows | `%LOCALAPPDATA%\VideoTranslator\Cache` |
 
-```gitignore
-# Model files - Keep small models, ignore large ones
-model/whisper/*.pt
-model/whisper/*.pth
-model/whisper/large*
-model/whisper/medium*
-!model/whisper/tiny*
-!model/whisper/base*
-!model/whisper/small*
-```
+设置了 `VIDEOTRANSLATOR_CACHE_DIR` 时，它会取代整套应用缓存目录；专用的
+`VIDEOTRANSLATOR_MODEL_DIR` 优先级更高。程序会创建目录并在支持 POSIX 权限的
+文件系统上尽量设为仅当前用户可访问。
 
-### 策略说明
-
-1. **默认忽略所有模型文件** (`*.pt`, `*.pth`)
-2. **允许小型模型** (`tiny`, `base`, `small`)
-3. **严格忽略大型模型** (`medium`, `large`)
-
-## 🚀 不同的处理方案
-
-### 方案 1: 不包含任何模型文件 (推荐)
-
-**优点**:
-- 仓库大小最小
-- 克隆速度最快
-- 不会遇到 GitHub 文件大小限制
-
-**配置**:
-```gitignore
-# 忽略所有模型文件
-model/whisper/*.pt
-model/whisper/*.pth
-model/whisper/*
-!model/whisper/.gitignore
-!model/whisper/README.md
-```
-
-**用户使用指南**:
-```markdown
-## 模型下载
-
-首次运行时，Whisper 会自动下载所需的模型文件到 `model/whisper/` 目录。
-
-或者手动下载：
-```bash
-python -c "import whisper; whisper.load_model('base')"
-```
-
-### 方案 2: 包含小型模型 (当前方案)
-
-**优点**:
-- 用户可以立即使用基本功能
-- 减少首次运行的等待时间
-- 平衡了仓库大小和用户体验
-
-**缺点**:
-- 仓库大小增加 ~650MB
-- 克隆时间较长
-
-**模型文件准备**:
-```bash
-# 下载并准备小型模型
-python -c "import whisper; whisper.load_model('tiny')"
-python -c "import whisper; whisper.load_model('base')"
-python -c "import whisper; whisper.load_model('small')"
-
-# 强制添加到 Git
-git add -f model/whisper/tiny.pt
-git add -f model/whisper/base.pt
-git add -f model/whisper/small.pt
-```
-
-### 方案 3: 使用 Git LFS
-
-**优点**:
-- 可以包含所有模型文件
-- 仓库历史记录保持轻量
-- 支持大文件版本控制
-
-**配置 Git LFS**:
-```bash
-# 安装 Git LFS
-git lfs install
-
-# 跟踪模型文件
-git lfs track "*.pt"
-git lfs track "*.pth"
-git lfs track "model/whisper/*"
-
-# 提交 .gitattributes
-git add .gitattributes
-git commit -m "Add Git LFS tracking for model files"
-
-# 添加模型文件
-git add model/whisper/*.pt
-git commit -m "Add Whisper model files"
-```
-
-### 方案 4: 外部下载链接
-
-**优点**:
-- 仓库最小化
-- 灵活的模型管理
-- 可以提供多个下载源
-
-**实现**:
-创建 `model/whisper/download_models.py`:
-```python
-import os
-import requests
-import whisper
-
-def download_model(model_name):
-    """下载指定的 Whisper 模型"""
-    print(f"正在下载 {model_name} 模型...")
-    model = whisper.load_model(model_name)
-    print(f"✅ {model_name} 模型下载完成")
-    return model
-
-def main():
-    models = ["tiny", "base", "small"]
-    for model_name in models:
-        try:
-            download_model(model_name)
-        except Exception as e:
-            print(f"❌ 下载 {model_name} 模型失败: {e}")
-
-if __name__ == "__main__":
-    main()
-```
-
-## 🛠️ 实际操作指南
-
-### 检查当前模型文件
+例如把大型权重放到独立磁盘：
 
 ```bash
-# 查看 model 目录内容
-dir model\whisper
-
-# 查看文件大小
-dir model\whisper *.pt
-
-# 检查 Git 状态
-git status model/whisper/
+# macOS / Linux
+export VIDEOTRANSLATOR_MODEL_DIR="/Volumes/Models/VideoTranslator/whisper"
+video-translator
 ```
 
-### 更改策略
+```powershell
+# Windows PowerShell
+$env:VIDEOTRANSLATOR_MODEL_DIR = "D:\Models\VideoTranslator\whisper"
+video-translator
+```
 
-#### 切换到方案 1 (不包含模型)
+## 下载与预热
+
+正常方式是在应用设置中选择模型并开始处理；`SpeechRecognizer` 会把下载目录显式
+传给 Whisper。若要在部署前预热缓存，请使用项目的路径解析器，避免 Whisper 的
+独立默认目录与应用目录不一致：
 
 ```bash
-# 从 Git 中移除所有模型文件
-git rm --cached model/whisper/*.pt
-git rm --cached model/whisper/*.pth
-
-# 更新 .gitignore
-echo model/whisper/* >> .gitignore
-echo !model/whisper/.gitignore >> .gitignore
-
-# 提交更改
-git commit -m "Remove model files from Git tracking"
+python -c "from app.utils.paths import ensure_private_directory,get_whisper_model_dir; import whisper; p=ensure_private_directory(get_whisper_model_dir()); whisper.load_model('base', download_root=str(p))"
 ```
 
-#### 切换到方案 2 (包含小型模型)
+下载需要网络与足够磁盘空间。模型越大通常准确率越高，但启动、推理、内存和磁盘
+成本也更高；默认 `base` 是较轻的通用起点。实际可用模型名称以当前设置界面和所
+安装的 `openai-whisper` 版本为准。
 
-```bash
-# 下载小型模型
-python -c "import whisper; whisper.load_model('tiny')"
-python -c "import whisper; whisper.load_model('base')"
+## 迁移和清理
 
-# 强制添加到 Git
-git add -f model/whisper/tiny.pt
-git add -f model/whisper/base.pt
+退出应用后，可把整个 `whisper/` 目录移动到新位置，再设置
+`VIDEOTRANSLATOR_MODEL_DIR` 指向它。不要在运行中移动正在读取的权重。
 
-# 提交
-git commit -m "Add small Whisper models"
-```
+清理时只删除上表解析出的模型目录。删除不会影响项目或字幕，但下次使用相应模型
+会重新下载。应用不会自动删除模型，因为下载成本高且用户可能在多个会话中复用。
 
-#### 切换到方案 3 (使用 Git LFS)
+## 仓库与发布规则
 
-```bash
-# 安装和配置 Git LFS
-git lfs install
-git lfs track "*.pt"
-git lfs track "*.pth"
-
-# 添加配置文件
-git add .gitattributes
-git commit -m "Add Git LFS configuration"
-
-# 添加模型文件
-git add model/whisper/*.pt
-git commit -m "Add model files with Git LFS"
-```
-
-### GitHub 上传注意事项
-
-1. **文件大小限制**: GitHub 单文件限制 100MB，仓库推荐小于 1GB
-2. **LFS 配额**: Git LFS 有存储和带宽限制
-3. **克隆速度**: 包含大文件会影响克隆速度
-4. **CI/CD**: 大文件可能影响自动化构建
-
-## 📝 README 更新
-
-无论选择哪种策略，都需要在 README.md 中说明：
-
-```markdown
-## 模型文件说明
-
-本项目使用 OpenAI Whisper 进行语音识别，需要下载相应的模型文件。
-
-### 自动下载 (推荐)
-首次运行时，应用程序会自动下载所需的模型文件。
-
-### 手动下载
-```bash
-# 下载基础模型
-python -c "import whisper; whisper.load_model('base')"
-
-# 下载其他模型
-python -c "import whisper; whisper.load_model('small')"
-```
-
-### 模型选择
-- **tiny**: 最快，准确率较低 (~39MB)
-- **base**: 平衡选择 (~142MB)
-- **small**: 较好准确率 (~466MB)
-- **medium**: 高准确率 (~1.5GB)
-- **large**: 最佳准确率 (~2.9GB)
-```
-
-## 🎯 推荐策略
-
-对于 VideoTranslator 项目，推荐使用 **方案 1** (不包含模型文件)：
-
-1. **保持仓库轻量**: 便于克隆和分发
-2. **用户体验**: 现代网络环境下，首次下载等待时间可接受
-3. **维护简单**: 不需要管理大文件的版本控制
-4. **CI/CD 友好**: 自动化构建和测试更快
-
-如果需要包含模型文件，建议使用 **Git LFS** 方案。
+- 不要把 `.pt`、`.pth` 或模型缓存强制加入 Git；`.gitignore` 已排除这些文件。
+- 不要把缓存目录放在源码树中，也不要用 Git LFS 分发第三方权重。
+- 构建 wheel、运行默认测试和编辑既有项目都不需要模型文件。
+- 完整转写环境需安装 `speech` extra：`python -m pip install -e ".[speech]"`。
+- 离线部署应在获准的环境预热应用缓存，并遵守模型来源的许可证和分发条款。

@@ -6,15 +6,17 @@ Handles subtitle file operations, format conversions, timing adjustments,
 and embedding subtitles into videos.
 """
 
+import codecs
+import logging
+import math
 import os
 import re
-import logging
-import codecs
-import tempfile
+import shutil
 import subprocess
-from typing import List, Dict, Tuple, Optional, Union, Any
-from dataclasses import dataclass
-from datetime import timedelta
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 # Third-party imports
 import pysrt
@@ -22,6 +24,7 @@ import webvtt
 from chardet import detect
 
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class SubtitleSegment:
@@ -31,11 +34,7 @@ class SubtitleSegment:
     original_text: str  # Original language text
     translated_text: str  # Translated text
     index: int = 0     # Subtitle index/number
-    style: Dict[str, Any] = None  # Style properties (font, color, position)
-
-    def __post_init__(self):
-        if self.style is None:
-            self.style = {}
+    style: Dict[str, Any] = field(default_factory=dict)
 
 
 class SubtitleProcessor:
@@ -66,12 +65,11 @@ class SubtitleProcessor:
         self._validate_dependencies()
     
     def _validate_dependencies(self) -> None:
-        """Validate external dependencies are available."""
-        try:
-            subprocess.run([self.ffmpeg_path, "-version"], 
-                          stdout=subprocess.PIPE, 
-                          stderr=subprocess.PIPE)
-        except (subprocess.SubprocessError, FileNotFoundError):
+        """Warn about a missing FFmpeg binary without starting a process."""
+
+        candidate = Path(self.ffmpeg_path).expanduser()
+        available = candidate.is_file() if candidate.parent != Path('.') else shutil.which(self.ffmpeg_path)
+        if not available:
             logger.warning("FFmpeg not found at specified path. "
                           "Subtitle embedding may not work correctly.")
     
@@ -102,6 +100,8 @@ class SubtitleProcessor:
                 return self._load_ass(file_path)
             elif file_ext == '.sub':
                 return self._load_sub(file_path)
+            elif file_ext == '.sbv':
+                return self._load_sbv(file_path)
             else:
                 raise ValueError(f"Unsupported subtitle format: {file_ext}")
         except Exception as e:
@@ -311,6 +311,39 @@ class SubtitleProcessor:
         
         self.segments = segments
         return segments
+
+    def _load_sbv(self, file_path: str) -> List[SubtitleSegment]:
+        """Load YouTube-style SBV timestamp blocks."""
+
+        encoding = self._detect_encoding(file_path)
+        content = Path(file_path).read_text(encoding=encoding).replace('\r\n', '\n')
+        segments = []
+        for index, block in enumerate(re.split(r'\n\s*\n', content.strip()), start=1):
+            lines = block.splitlines()
+            if len(lines) < 2 or ',' not in lines[0]:
+                raise ValueError(f"Invalid SBV block {index}")
+            start_value, end_value = (part.strip() for part in lines[0].split(',', 1))
+            segments.append(
+                SubtitleSegment(
+                    start_time=self._parse_sbv_time(start_value),
+                    end_time=self._parse_sbv_time(end_value),
+                    original_text='\n'.join(lines[1:]),
+                    translated_text='',
+                    index=index,
+                )
+            )
+        self.segments = segments
+        return segments
+
+    @staticmethod
+    def _parse_sbv_time(value: str) -> float:
+        match = re.fullmatch(r'(\d+):(\d{2}):(\d{2})[.,](\d{3})', value)
+        if not match:
+            raise ValueError(f"Invalid SBV timestamp: {value}")
+        hours, minutes, seconds, milliseconds = map(int, match.groups())
+        if minutes >= 60 or seconds >= 60:
+            raise ValueError(f"Invalid SBV timestamp: {value}")
+        return hours * 3600 + minutes * 60 + seconds + milliseconds / 1000
     
     def _parse_ass_time(self, time_str: str) -> float:
         """
@@ -363,7 +396,7 @@ class SubtitleProcessor:
         Returns:
             Tuple of (hours, minutes, seconds, milliseconds)
         """
-        total_milliseconds = int(seconds * 1000)
+        total_milliseconds = round(seconds * 1000)
         
         hours = total_milliseconds // 3600000
         total_milliseconds %= 3600000
@@ -394,18 +427,19 @@ class SubtitleProcessor:
                 subtitle_seg = SubtitleSegment(
                     start_time=float(start_val),
                     end_time=float(end_val),
-                    original_text=orig,
-                    translated_text=trans,
+                    original_text=str(orig or ''),
+                    translated_text=str(trans or ''),
                     index=i+1,
-                    style=style
+                    style=dict(style) if isinstance(style, dict) else {},
                 )
                 self.segments.append(subtitle_seg)
             except (ValueError, TypeError) as e:
                 logger.warning(f"Skipping invalid segment {i}: {e}")
         return self.segments
     
-    def save_to_file(self, output_path: str, format_type: str = None, 
-                    include_original: bool = False) -> str:
+    def save_to_file(self, output_path: str, format_type: str = None,
+                    include_original: bool = False,
+                    language_mode: str = None) -> str:
         """
         Save subtitle segments to a file in the specified format.
         
@@ -420,35 +454,80 @@ class SubtitleProcessor:
         Raises:
             ValueError: If format is not supported or segments are empty
         """
+        if language_mode is None:
+            language_mode = 'bilingual' if include_original else 'translation_only'
+        if language_mode not in {'original_only', 'translation_only', 'bilingual'}:
+            raise ValueError(f"Unsupported subtitle language mode: {language_mode}")
         if not self.segments:
             raise ValueError("No subtitle segments to save")
+
+        for index, segment in enumerate(self.segments, start=1):
+            if (
+                not math.isfinite(segment.start_time)
+                or not math.isfinite(segment.end_time)
+                or segment.start_time < 0
+                or segment.end_time <= segment.start_time
+            ):
+                raise ValueError(f"Invalid timing in subtitle segment {index}")
         
         # If format not specified, infer from output path
         if format_type is None:
             ext = os.path.splitext(output_path)[1].lower()
-            format_type = ext[1:] if ext in ['.srt', '.vtt', '.ass', '.ssa', '.sub'] else 'srt'
+            format_type = (
+                ext[1:]
+                if ext in ['.srt', '.vtt', '.ass', '.ssa', '.sub', '.sbv']
+                else 'srt'
+            )
         
+        format_type = str(format_type).lower().lstrip('.')
+
         # Make sure format is supported
         if format_type not in self.SUPPORTED_FORMATS:
             raise ValueError(f"Unsupported subtitle format: {format_type}")
             
-        # Ensure the directory exists
-        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-        
-        # Call appropriate save method based on format
-        if format_type == 'srt':
-            self._save_srt(output_path, include_original)
-        elif format_type == 'vtt':
-            self._save_vtt(output_path, include_original)
-        elif format_type in ['ass', 'ssa']:
-            self._save_ass(output_path, include_original)
-        elif format_type == 'sub':
-            self._save_sub(output_path, include_original)
+        destination = Path(output_path).expanduser().resolve()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_value = tempfile.mkstemp(
+            prefix='.videotranslator-subtitle-',
+            suffix=destination.suffix or f'.{format_type}',
+            dir=destination.parent,
+        )
+        os.close(descriptor)
+        temporary_path = Path(temporary_value)
+        try:
+            if format_type == 'srt':
+                self._save_srt(str(temporary_path), language_mode)
+            elif format_type == 'vtt':
+                self._save_vtt(str(temporary_path), language_mode)
+            elif format_type in ['ass', 'ssa']:
+                self._save_ass(str(temporary_path), language_mode)
+            elif format_type == 'sub':
+                self._save_sub(str(temporary_path), language_mode)
+            elif format_type == 'sbv':
+                self._save_sbv(str(temporary_path), language_mode)
+            with open(temporary_path, 'rb') as subtitle_file:
+                os.fsync(subtitle_file.fileno())
+            os.replace(temporary_path, destination)
+        finally:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Could not remove temporary subtitle file: %s", temporary_path)
         
         logger.info(f"Saved subtitles to {output_path} in {format_type} format")
         return output_path
     
-    def _save_srt(self, output_path: str, include_original: bool = False) -> None:
+    @staticmethod
+    def _segment_text(segment: SubtitleSegment, language_mode: str,
+                      line_break: str = '\n') -> str:
+        if language_mode == 'original_only':
+            return segment.original_text
+        if language_mode == 'translation_only':
+            return segment.translated_text or segment.original_text
+        parts = [part for part in (segment.original_text, segment.translated_text) if part]
+        return line_break.join(parts)
+
+    def _save_srt(self, output_path: str, language_mode: str) -> None:
         """
         Save subtitles in SRT format.
         
@@ -471,10 +550,7 @@ class SubtitleProcessor:
             srt_content.append(timestamp)
             
             # Format text based on whether to include original
-            if include_original and segment.original_text:
-                text = f"{segment.original_text}\n{segment.translated_text}"
-            else:
-                text = segment.translated_text or segment.original_text
+            text = self._segment_text(segment, language_mode)
             
             srt_content.append(text)
             srt_content.append("")  # Empty line between entries
@@ -483,7 +559,7 @@ class SubtitleProcessor:
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(srt_content))
     
-    def _save_vtt(self, output_path: str, include_original: bool = False) -> None:
+    def _save_vtt(self, output_path: str, language_mode: str) -> None:
         """
         Save subtitles in WebVTT format.
         
@@ -507,10 +583,7 @@ class SubtitleProcessor:
             vtt_content.append(timestamp)
             
             # Format text
-            if include_original and segment.original_text:
-                text = f"{segment.original_text}\n{segment.translated_text}"
-            else:
-                text = segment.translated_text or segment.original_text
+            text = self._segment_text(segment, language_mode)
                 
             vtt_content.append(text)
             vtt_content.append("")  # Empty line between entries
@@ -519,7 +592,7 @@ class SubtitleProcessor:
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(vtt_content))
     
-    def _save_ass(self, output_path: str, include_original: bool = False) -> None:
+    def _save_ass(self, output_path: str, language_mode: str) -> None:
         """
         Save subtitles in ASS/SSA format.
         
@@ -560,10 +633,8 @@ class SubtitleProcessor:
             end_time = f"{end_h}:{end_m:02d}:{end_s:02d}.{end_cs:02d}"
             
             # Format text
-            if include_original and segment.original_text:
-                text = f"{segment.original_text}\\N{segment.translated_text}"
-            else:
-                text = segment.translated_text or segment.original_text
+            text = self._segment_text(segment, language_mode, '\\N')
+            text = text.replace('\r\n', '\n').replace('\r', '\n').replace('\n', '\\N')
             
             # Create dialogue line
             dialogue = f"Dialogue: 0,{start_time},{end_time},Default,,0,0,0,,{text}"
@@ -576,7 +647,7 @@ class SubtitleProcessor:
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(ass_content))
     
-    def _save_sub(self, output_path: str, include_original: bool = False) -> None:
+    def _save_sub(self, output_path: str, language_mode: str) -> None:
         """
         Save subtitles in MicroDVD .sub format.
         
@@ -596,10 +667,8 @@ class SubtitleProcessor:
             end_frame = int(segment.end_time * fps)
             
             # Format text
-            if include_original and segment.original_text:
-                text = f"{segment.original_text}|{segment.translated_text}"
-            else:
-                text = segment.translated_text or segment.original_text
+            text = self._segment_text(segment, language_mode, '|')
+            text = text.replace('\r\n', '\n').replace('\r', '\n').replace('\n', '|')
             
             # Create line
             line = f"{{{start_frame}}}{{{end_frame}}}{text}"
@@ -608,6 +677,25 @@ class SubtitleProcessor:
         # Write to file
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(sub_content))
+
+    def _save_sbv(self, output_path: str, language_mode: str) -> None:
+        """Save subtitles in YouTube SBV format."""
+
+        blocks = []
+        for segment in self.segments:
+            start = self._format_sbv_time(segment.start_time)
+            end = self._format_sbv_time(segment.end_time)
+            text = self._segment_text(segment, language_mode)
+            blocks.append(f"{start},{end}\n{text}")
+        Path(output_path).write_text('\n\n'.join(blocks) + '\n', encoding='utf-8')
+
+    @staticmethod
+    def _format_sbv_time(seconds: float) -> str:
+        total_milliseconds = round(seconds * 1000)
+        hours, remainder = divmod(total_milliseconds, 3_600_000)
+        minutes, remainder = divmod(remainder, 60_000)
+        whole_seconds, milliseconds = divmod(remainder, 1000)
+        return f"{hours}:{minutes:02d}:{whole_seconds:02d}.{milliseconds:03d}"
     
     def adjust_timing(self, offset_seconds: float = 0, scale_factor: float = 1.0) -> None:
         """
@@ -786,6 +874,7 @@ class SubtitleProcessor:
         if not self.segments:
             issues.append({
                 'type': 'error',
+                'code': 'no_segments',
                 'message': 'No subtitle segments found',
                 'segment_idx': None
             })
@@ -794,10 +883,23 @@ class SubtitleProcessor:
         prev_end = -1
         
         for i, segment in enumerate(self.segments):
+            if not (
+                math.isfinite(segment.start_time)
+                and math.isfinite(segment.end_time)
+            ):
+                issues.append({
+                    'type': 'error',
+                    'code': 'non_finite_timing',
+                    'message': 'Start and end times must be finite numbers',
+                    'segment_idx': i,
+                })
+                continue
+
             # Check for invalid timing
             if segment.start_time < 0:
                 issues.append({
                     'type': 'error',
+                    'code': 'negative_start',
                     'message': f'Negative start time: {segment.start_time:.3f}s',
                     'segment_idx': i
                 })
@@ -805,6 +907,7 @@ class SubtitleProcessor:
             if segment.end_time <= segment.start_time:
                 issues.append({
                     'type': 'error',
+                    'code': 'invalid_range',
                     'message': f'End time ({segment.end_time:.3f}s) <= start time ({segment.start_time:.3f}s)',
                     'segment_idx': i
                 })
@@ -813,180 +916,97 @@ class SubtitleProcessor:
             if segment.start_time < prev_end:
                 issues.append({
                     'type': 'warning',
+                    'code': 'overlap',
                     'message': f'Overlaps with previous segment (starts at {segment.start_time:.3f}s, previous ends at {prev_end:.3f}s)',
                     'segment_idx': i
                 })
             
             # Check for very short segments
-            if segment.end_time - segment.start_time < 0.5:
+            duration = segment.end_time - segment.start_time
+            if 0 < duration < 0.5:
                 issues.append({
                     'type': 'warning',
-                    'message': f'Very short duration: {(segment.end_time - segment.start_time):.3f}s',
+                    'code': 'very_short',
+                    'message': f'Very short duration: {duration:.3f}s',
                     'segment_idx': i
                 })
             
             # Check for very long segments
-            if segment.end_time - segment.start_time > 7:
+            if duration > 7:
                 issues.append({
                     'type': 'warning',
-                    'message': f'Very long duration: {(segment.end_time - segment.start_time):.3f}s',
+                    'code': 'very_long',
+                    'message': f'Very long duration: {duration:.3f}s',
                     'segment_idx': i
                 })
             
             # Check for missing text
-            if not segment.original_text and not segment.translated_text:
+            if not segment.original_text.strip() and not segment.translated_text.strip():
                 issues.append({
                     'type': 'warning',
+                    'code': 'empty_text',
                     'message': 'Segment has no text',
                     'segment_idx': i
                 })
             
             # Update for next iteration
-            prev_end = segment.end_time
+            prev_end = max(prev_end, segment.end_time)
         
         return issues
     
     def embed_subtitles_in_video(self, video_path: str, output_path: str,
                                 format_type: str = 'srt') -> str:
-        """
-        Embed subtitles directly into a video file.
-        
-        Args:
-            video_path: Path to the input video file
-            output_path: Path to save the output video
-            format_type: Subtitle format to use for embedding
-            
-        Returns:
-            Path to the output video file
-            
-        Raises:
-            ValueError: If ffmpeg is not available or other error occurs
-        """
-        if not os.path.exists(video_path):
+        """Compatibility wrapper around :class:`VideoProcessor` soft muxing."""
+
+        if not Path(video_path).is_file():
             raise FileNotFoundError(f"Video file not found: {video_path}")
-            
         if not self.segments:
             raise ValueError("No subtitle segments to embed")
-        
-        # Create a temporary subtitle file
-        with tempfile.NamedTemporaryFile(suffix=f".{format_type}", delete=False) as tmp_file:
-            subtitle_path = tmp_file.name
-        
-        try:
-            # Save subtitles to the temp file
-            self.save_to_file(subtitle_path, format_type)
-            
-            # Prepare FFmpeg command
-            cmd = [
-                self.ffmpeg_path,
-                '-i', video_path,             # Input video
-                '-i', subtitle_path,          # Input subtitle
-                '-c:v', 'copy',               # Copy video stream
-                '-c:a', 'copy',               # Copy audio stream
-                '-c:s', 'mov_text' if output_path.lower().endswith('.mp4') else 'copy',  # Subtitle codec
-                '-map', '0:v',                # Map video from first input
-                '-map', '0:a?',               # Map audio from first input if exists
-                '-map', '1',                  # Map subtitles from second input
-                '-y',                         # Overwrite output
-                output_path                   # Output file
-            ]
-            
-            # Execute FFmpeg command
-            logger.info(f"Embedding subtitles using command: {' '.join(cmd)}")
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            
-            if result.returncode != 0:
-                logger.error(f"Failed to embed subtitles: {result.stderr}")
-                raise ValueError(f"FFmpeg error: {result.stderr}")
-                
-            logger.info(f"Successfully embedded subtitles into {output_path}")
-            return output_path
-            
-        finally:
-            # Clean up temporary file
-            try:
-                os.unlink(subtitle_path)
-            except Exception as e:
-                logger.warning(f"Failed to delete temporary subtitle file: {e}")
+        if format_type not in {'srt', 'vtt', 'ass', 'ssa'}:
+            raise ValueError(f"Unsupported subtitle format: {format_type}")
+
+        from app.core.video import VideoProcessor
+
+        with tempfile.TemporaryDirectory(prefix='videotranslator-subtitles-') as workspace:
+            subtitle_path = Path(workspace) / f'subtitle.{format_type}'
+            self.save_to_file(str(subtitle_path), format_type)
+            processor = VideoProcessor(ffmpeg_path=self.ffmpeg_path)
+            if not processor.embed_subtitles_to_video(
+                video_path, str(subtitle_path), output_path
+            ):
+                raise ValueError(
+                    "FFmpeg could not embed subtitles in the selected output container"
+                )
+        return output_path
     
     def burn_subtitles_into_video(self, video_path: str, output_path: str,
                                  font_size: int = 24, font_color: str = 'white',
                                  position: str = 'bottom') -> str:
-        """
-        Burn subtitles directly into the video (hardcode).
-        
-        Args:
-            video_path: Path to the input video file
-            output_path: Path to save the output video
-            font_size: Font size for subtitles
-            font_color: Font color for subtitles
-            position: Position of subtitles ('bottom', 'top', 'middle')
-            
-        Returns:
-            Path to the output video file
-            
-        Raises:
-            ValueError: If ffmpeg is not available or other error occurs
-        """
-        if not os.path.exists(video_path):
+        """Compatibility wrapper around the safe hard-subtitle implementation."""
+
+        if not Path(video_path).is_file():
             raise FileNotFoundError(f"Video file not found: {video_path}")
-            
         if not self.segments:
             raise ValueError("No subtitle segments to burn")
-        
-        # Create a temporary subtitle file (using ASS for better style control)
-        with tempfile.NamedTemporaryFile(suffix=".ass", delete=False) as tmp_file:
-            subtitle_path = tmp_file.name
-        
-        try:
-            # Configure subtitle position
-            if position == 'top':
-                pos_value = '2'  # Top-center
-            elif position == 'middle':
-                pos_value = '5'  # Middle-center
-            else:
-                pos_value = '2'  # Bottom-center (default)
-            
-            # Apply styles for burn-in
-            for segment in self.segments:
-                if segment.style is None:
-                    segment.style = {}
-                segment.style.update({
-                    'alignment': pos_value,
-                    'fontsize': str(font_size),
-                    'primarycolour': font_color
-                })
-            
-            # Save subtitles to the temp file
-            self.save_to_file(subtitle_path, 'ass')
-            
-            # Prepare FFmpeg command
-            cmd = [
-                self.ffmpeg_path,
-                '-i', video_path,             # Input video
-                '-vf', f"ass={subtitle_path}",  # Apply subtitles as filter
-                '-c:a', 'copy',               # Copy audio stream
-                '-y',                         # Overwrite output
-                output_path                   # Output file
-            ]
-            
-            # Execute FFmpeg command
-            logger.info(f"Burning subtitles using command: {' '.join(cmd)}")
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            
-            if result.returncode != 0:
-                logger.error(f"Failed to burn subtitles: {result.stderr}")
-                raise ValueError(f"FFmpeg error: {result.stderr}")
-                
-            logger.info(f"Successfully burned subtitles into {output_path}")
-            return output_path
-            
-        finally:
-            # Clean up temporary file
-            try:
-                os.unlink(subtitle_path)
-            except Exception as e:
-                logger.warning(f"Failed to delete temporary subtitle file: {e}")
+
+        from app.core.video import VideoProcessor
+
+        with tempfile.TemporaryDirectory(prefix='videotranslator-subtitles-') as workspace:
+            subtitle_path = Path(workspace) / 'subtitle.ass'
+            self.save_to_file(str(subtitle_path), 'ass')
+            processor = VideoProcessor(ffmpeg_path=self.ffmpeg_path)
+            if not processor.burn_subtitles_to_video(
+                video_path,
+                str(subtitle_path),
+                output_path,
+                font_size=font_size,
+                font_color=font_color,
+                position=position,
+            ):
+                raise ValueError(
+                    "FFmpeg could not render subtitles; a build with libass is required"
+                )
+        return output_path
     
     def extract_subtitles_from_video(self, video_path: str) -> Optional[List[SubtitleSegment]]:
         """

@@ -8,21 +8,24 @@ terminology management, and error recovery.
 Refactored version with improved performance and maintainability.
 """
 
-import os
-import logging
-import json
 import hashlib
-import time
+import html
+import json
+import logging
 import re
-from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Optional, Tuple, Union, Set
-from dataclasses import dataclass, field
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import lru_cache
 import sqlite3
+import threading
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+from app.utils.paths import ensure_private_directory, get_cache_dir
 
 logger = logging.getLogger(__name__)
 
@@ -90,20 +93,17 @@ class TranslationCache:
         
         # Determine cache path
         if cache_path is None:
-            user_cache_dir = os.path.join(
-                os.path.expanduser("~"),
-                ".cache",
-                "video_translator"
-            )
-            os.makedirs(user_cache_dir, exist_ok=True)
-            self.cache_path = os.path.join(user_cache_dir, "translation_cache.db")
+            cache_dir = ensure_private_directory(get_cache_dir())
+            self.cache_path = str(cache_dir / "translation-cache.db")
         else:
-            self.cache_path = cache_path
+            self.cache_path = str(Path(cache_path).expanduser())
+            Path(self.cache_path).parent.mkdir(parents=True, exist_ok=True)
             
         self._init_db()
         
     def _init_db(self):
         """Initialize the SQLite database for persistent caching."""
+        self._db_lock = threading.RLock()
         self.conn = sqlite3.connect(self.cache_path, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")
         
@@ -155,19 +155,26 @@ class TranslationCache:
             return self._memory_cache[key]
         
         # Check persistent cache
-        cursor = self.conn.cursor()
-        cursor.execute(
-            "SELECT original_text, translated_text, source_lang, target_lang, "
-            "service, confidence, metadata FROM translations WHERE hash = ?", 
-            (key,)
-        )
-        
-        result = cursor.fetchone()
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT original_text, translated_text, source_lang, target_lang, "
+                "service, confidence, metadata FROM translations WHERE hash = ?",
+                (key,)
+            )
+            result = cursor.fetchone()
         if result:
             original, translated, src_lang, tgt_lang, svc, confidence, metadata_str = result
             
             # Parse metadata
-            metadata = json.loads(metadata_str) if metadata_str else {}
+            try:
+                metadata = json.loads(metadata_str) if metadata_str else {}
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("Ignoring translation cache entry with invalid metadata")
+                with self._db_lock:
+                    self.conn.execute("DELETE FROM translations WHERE hash = ?", (key,))
+                    self.conn.commit()
+                return None
                 
             # Create result object
             translation_result = TranslationResult(
@@ -204,17 +211,42 @@ class TranslationCache:
         # Store in persistent cache
         metadata_str = json.dumps(result.metadata) if result.metadata else None
         
-        self.conn.execute(
-            "INSERT OR REPLACE INTO translations "
-            "(hash, original_text, translated_text, source_lang, target_lang, "
-            "service, timestamp, confidence, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                key, result.original_text, result.translated_text,
-                result.source_lang, result.target_lang, result.service,
-                time.time(), result.confidence, metadata_str
+        with self._db_lock:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO translations "
+                "(hash, original_text, translated_text, source_lang, target_lang, "
+                "service, timestamp, confidence, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    key, result.original_text, result.translated_text,
+                    result.source_lang, result.target_lang, result.service,
+                    time.time(), result.confidence, metadata_str
+                )
             )
-        )
-        self.conn.commit()
+            self.conn.commit()
+
+    def close(self) -> None:
+        """Flush and close the persistent cache connection idempotently."""
+        connection = getattr(self, "conn", None)
+        if connection is None:
+            return
+        with self._db_lock:
+            connection.commit()
+            connection.close()
+            self.conn = None
+
+    def clear(self) -> None:
+        """Remove persistent and in-memory translations atomically."""
+        with self._db_lock:
+            self.conn.execute("DELETE FROM translations")
+            self.conn.commit()
+        self._memory_cache.clear()
+        self._access_order.clear()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc_info) -> None:
+        self.close()
 
 
 class TerminologyManager:
@@ -294,7 +326,7 @@ class TranslatorInterface(ABC):
         pass
     
     def translate_batch(self, requests: List[TranslationRequest]) -> List[TranslationResult]:
-        """Translate multiple texts. Default implementation processes sequentially."""
+        """Translate multiple texts sequentially and preserve per-item failures."""
         results = []
         for request in requests:
             try:
@@ -310,7 +342,11 @@ class TranslatorInterface(ABC):
                     target_lang=request.target_lang,
                     confidence=0.0,
                     service=self.__class__.__name__,
-                    metadata={"error": str(e)}
+                    metadata={
+                        "error": str(e),
+                        "success": False,
+                        "fallback": False,
+                    }
                 ))
         return results
     
@@ -337,9 +373,12 @@ class DeepLTranslator(TranslatorInterface):
         headers = {"Authorization": f"DeepL-Auth-Key {self.api_key}"}
         data = {
             "text": [request.text],
-            "source_lang": request.source_lang.upper(),
             "target_lang": request.target_lang.upper(),
         }
+        # DeepL performs language detection when source_lang is omitted; the
+        # literal value "AUTO" is not a valid API language code.
+        if request.source_lang.lower() != "auto":
+            data["source_lang"] = request.source_lang.upper()
         
         try:
             response = self.session.post(
@@ -361,7 +400,11 @@ class DeepLTranslator(TranslatorInterface):
                 target_lang=request.target_lang,
                 confidence=0.95,  # DeepL generally high quality
                 service="DeepL",
-                metadata={"detected_language": detected_lang}
+                metadata={
+                    "detected_language": detected_lang,
+                    "success": True,
+                    "fallback": False,
+                }
             )
         except requests.exceptions.RequestException as e:
             raise ServiceUnavailableError(f"DeepL API error: {e}")
@@ -370,6 +413,8 @@ class DeepLTranslator(TranslatorInterface):
         """DeepL supports batch translation."""
         if not requests:
             return []
+        if not self.api_key:
+            raise ServiceUnavailableError("DeepL API key not configured")
         
         # Group by language pair for efficiency
         grouped = {}
@@ -387,9 +432,10 @@ class DeepLTranslator(TranslatorInterface):
             headers = {"Authorization": f"DeepL-Auth-Key {self.api_key}"}
             data = {
                 "text": texts,
-                "source_lang": source_lang.upper(),
                 "target_lang": target_lang.upper(),
             }
+            if source_lang.lower() != "auto":
+                data["source_lang"] = source_lang.upper()
             
             try:
                 response = self.session.post(
@@ -402,6 +448,10 @@ class DeepLTranslator(TranslatorInterface):
                 
                 result_data = response.json()
                 translations = result_data["translations"]
+                if len(translations) != len(items):
+                    raise TranslationError(
+                        "DeepL returned a different number of translations"
+                    )
                 
                 for (original_idx, req), translation in zip(items, translations):
                     results[original_idx] = TranslationResult(
@@ -410,7 +460,8 @@ class DeepLTranslator(TranslatorInterface):
                         source_lang=translation.get("detected_source_language", source_lang).lower(),
                         target_lang=target_lang,
                         confidence=0.95,
-                        service="DeepL"
+                        service="DeepL",
+                        metadata={"success": True, "fallback": False},
                     )
                     
             except Exception as e:
@@ -424,26 +475,303 @@ class DeepLTranslator(TranslatorInterface):
                         target_lang=req.target_lang,
                         confidence=0.0,
                         service="DeepL",
-                        metadata={"error": str(e)}
+                        metadata={
+                            "error": str(e),
+                            "success": False,
+                            "fallback": False,
+                        }
                     )
         
         return results
     
     def is_available(self) -> bool:
-        """Check DeepL service availability."""
-        if not self.api_key:
-            return False
-        
+        """Return whether DeepL is configured without a redundant network probe.
+
+        ``translate_single`` is the authoritative availability check and lets
+        the manager fail over on real API errors.  Calling ``/usage`` here made
+        every subtitle incur an extra request and could incorrectly skip a
+        healthy translation endpoint during a transient usage-endpoint error.
+        """
+
+        return bool(self.api_key)
+
+
+class OpenAITranslator(TranslatorInterface):
+    """Translate text with OpenAI's Responses API."""
+
+    def __init__(self, api_key: str, model: str = "gpt-5.6-luna", **kwargs):
+        super().__init__(api_key, **kwargs)
+        self.model = model
+        self.base_url = "https://api.openai.com/v1/responses"
+
+    @staticmethod
+    def _language_label(language_code: str) -> str:
+        labels = {
+            "ar": "Arabic",
+            "de": "German",
+            "en": "English",
+            "es": "Spanish",
+            "fr": "French",
+            "it": "Italian",
+            "ja": "Japanese",
+            "ko": "Korean",
+            "pt": "Portuguese",
+            "ru": "Russian",
+            "zh": "Chinese",
+            "zh-cn": "Simplified Chinese",
+            "zh-tw": "Traditional Chinese",
+        }
+        normalized = language_code.lower()
+        return labels.get(normalized, labels.get(normalized.split("-")[0], language_code))
+
+    @staticmethod
+    def _extract_output_text(response_data: Dict[str, Any]) -> str:
+        """Extract assistant text from the raw Responses API response."""
+        if isinstance(response_data.get("output_text"), str):
+            return response_data["output_text"].strip()
+
+        text_parts = []
+        for item in response_data.get("output", []):
+            if item.get("type") != "message" or item.get("role") != "assistant":
+                continue
+            for content in item.get("content", []):
+                if content.get("type") in {"output_text", "text"}:
+                    value = content.get("text")
+                    if isinstance(value, str):
+                        text_parts.append(value)
+
+        return "".join(text_parts).strip()
+
+    @staticmethod
+    def _raise_for_api_error(response: requests.Response) -> None:
+        if response.status_code == 429:
+            raise QuotaExceededError("OpenAI API quota or rate limit exceeded")
+        if response.status_code in {401, 403}:
+            raise ServiceUnavailableError("OpenAI API key is invalid or unauthorized")
         try:
-            headers = {"Authorization": f"DeepL-Auth-Key {self.api_key}"}
-            response = self.session.get(
-                f"{self.base_url}/usage",
-                headers=headers,
-                timeout=5
+            response.raise_for_status()
+        except requests.exceptions.RequestException as exc:
+            raise ServiceUnavailableError(f"OpenAI API error: {exc}") from exc
+
+    def translate_single(self, request: TranslationRequest) -> TranslationResult:
+        if not self.api_key:
+            raise ServiceUnavailableError("OpenAI API key not configured")
+
+        source_label = (
+            "the detected source language"
+            if request.source_lang == "auto"
+            else self._language_label(request.source_lang)
+        )
+        target_label = self._language_label(request.target_lang)
+        instructions = (
+            "You are a professional subtitle translator. Translate faithfully "
+            f"from {source_label} to {target_label}. Return only the translated "
+            "text, with no preamble, quotation marks, or commentary. Preserve "
+            "line breaks, punctuation, tone, names, and subtitle timing cues."
+        )
+        if request.context:
+            instructions += f" Context: {request.context}"
+        if request.terminology:
+            glossary = ", ".join(
+                f"{source} -> {target}"
+                for source, target in request.terminology.items()
             )
-            return response.status_code == 200
-        except Exception:
-            return False
+            instructions += f" Required terminology: {glossary}"
+
+        payload = {
+            "model": self.model,
+            "instructions": instructions,
+            "input": request.text,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            response = self.session.post(
+                self.base_url,
+                headers=headers,
+                json=payload,
+                timeout=DEFAULT_TIMEOUT * 2,
+            )
+            self._raise_for_api_error(response)
+            response_data = response.json()
+        except (QuotaExceededError, ServiceUnavailableError):
+            raise
+        except (requests.exceptions.RequestException, ValueError) as exc:
+            raise ServiceUnavailableError(f"OpenAI API error: {exc}") from exc
+
+        translated_text = self._extract_output_text(response_data)
+        if not translated_text:
+            raise TranslationError("OpenAI Responses API returned no translated text")
+
+        return TranslationResult(
+            original_text=request.text,
+            translated_text=translated_text,
+            source_lang=request.source_lang,
+            target_lang=request.target_lang,
+            confidence=0.9,
+            service="OpenAI",
+            metadata={
+                "provider": "openai",
+                "model": response_data.get("model", self.model),
+                "response_id": response_data.get("id"),
+                "usage": response_data.get("usage", {}),
+                "success": True,
+                "fallback": False,
+            },
+        )
+
+    def translate_batch(
+        self, requests: List[TranslationRequest]
+    ) -> List[TranslationResult]:
+        """Translate a batch while preserving the abstract adapter contract."""
+        if not requests:
+            return []
+
+        # Each Responses API call returns one unconstrained text value. Keeping
+        # one request per subtitle avoids delimiter/JSON hallucinations and
+        # ensures subtitle-to-result alignment. The manager can still fail over
+        # individual failed entries to another provider.
+        return super().translate_batch(requests)
+
+    def is_available(self) -> bool:
+        # Avoid a paid/network probe for every subtitle. A configured key means
+        # the service is eligible; translate_single reports authoritative API
+        # errors and lets the manager fail over.
+        return bool(self.api_key)
+
+
+class GoogleTranslator(TranslatorInterface):
+    """Google Cloud Translation Basic (v2) REST adapter."""
+
+    def __init__(self, api_key: str, **kwargs):
+        super().__init__(api_key, **kwargs)
+        self.base_url = "https://translation.googleapis.com/language/translate/v2"
+
+    @staticmethod
+    def _normalize_language_code(language_code: str) -> str:
+        normalized = language_code.strip()
+        if normalized.lower() == "auto":
+            return ""
+        # Google's documented examples use ISO-639 codes. Keep regions for
+        # Chinese, where zh-CN/zh-TW carry useful script intent.
+        if normalized.lower().startswith("zh-"):
+            return normalized
+        return normalized.split("-")[0]
+
+    @staticmethod
+    def _raise_for_api_error(response: requests.Response) -> None:
+        if response.status_code == 429:
+            raise QuotaExceededError("Google Translation API quota or rate limit exceeded")
+        if response.status_code in {400, 401, 403}:
+            raise ServiceUnavailableError(
+                "Google Translation API rejected the request or API key"
+            )
+        try:
+            response.raise_for_status()
+        except requests.exceptions.RequestException as exc:
+            raise ServiceUnavailableError(f"Google Translation API error: {exc}") from exc
+
+    def _translate_requests(
+        self, requests_to_translate: List[TranslationRequest]
+    ) -> List[TranslationResult]:
+        if not self.api_key:
+            raise ServiceUnavailableError("Google Translation API key not configured")
+        if not requests_to_translate:
+            return []
+
+        source_lang = requests_to_translate[0].source_lang
+        target_lang = requests_to_translate[0].target_lang
+        data = {
+            "q": [request.text for request in requests_to_translate],
+            "target": self._normalize_language_code(target_lang),
+            "format": "text",
+        }
+        normalized_source = self._normalize_language_code(source_lang)
+        if normalized_source:
+            data["source"] = normalized_source
+
+        try:
+            response = self.session.post(
+                self.base_url,
+                params={"key": self.api_key},
+                json=data,
+                timeout=DEFAULT_TIMEOUT,
+            )
+            self._raise_for_api_error(response)
+            translations = response.json().get("data", {}).get("translations", [])
+        except (QuotaExceededError, ServiceUnavailableError):
+            raise
+        except (requests.exceptions.RequestException, ValueError) as exc:
+            raise ServiceUnavailableError(
+                f"Google Translation API error: {exc}"
+            ) from exc
+
+        if len(translations) != len(requests_to_translate):
+            raise TranslationError(
+                "Google Translation API returned a different number of translations"
+            )
+
+        results = []
+        for request, translation in zip(requests_to_translate, translations):
+            translated_text = translation.get("translatedText")
+            if not isinstance(translated_text, str):
+                raise TranslationError("Google Translation API returned invalid text")
+            detected_lang = translation.get(
+                "detectedSourceLanguage", request.source_lang
+            )
+            results.append(
+                TranslationResult(
+                    original_text=request.text,
+                    translated_text=html.unescape(translated_text),
+                    source_lang=detected_lang,
+                    target_lang=request.target_lang,
+                    confidence=1.0,
+                    service="Google",
+                    metadata={
+                        "provider": "google",
+                        "detected_source_language": detected_lang,
+                        "model": translation.get("model", "nmt"),
+                        "success": True,
+                        "fallback": False,
+                    },
+                )
+            )
+        return results
+
+    def translate_single(self, request: TranslationRequest) -> TranslationResult:
+        return self._translate_requests([request])[0]
+
+    def translate_batch(
+        self, requests: List[TranslationRequest]
+    ) -> List[TranslationResult]:
+        if not requests:
+            return []
+
+        # Manager requests share a language pair, but grouping here keeps the
+        # adapter safe for direct callers and honors Google's 128-string limit.
+        results: List[Optional[TranslationResult]] = [None] * len(requests)
+        grouped: Dict[Tuple[str, str], List[Tuple[int, TranslationRequest]]] = {}
+        for index, request in enumerate(requests):
+            grouped.setdefault(
+                (request.source_lang, request.target_lang), []
+            ).append((index, request))
+
+        for items in grouped.values():
+            for offset in range(0, len(items), 128):
+                chunk = items[offset:offset + 128]
+                chunk_results = self._translate_requests(
+                    [request for _, request in chunk]
+                )
+                for (index, _), result in zip(chunk, chunk_results):
+                    results[index] = result
+
+        return [result for result in results if result is not None]
+
+    def is_available(self) -> bool:
+        return bool(self.api_key)
 
 
 class FallbackTranslator(TranslatorInterface):
@@ -458,7 +786,7 @@ class FallbackTranslator(TranslatorInterface):
     
     def translate_single(self, request: TranslationRequest) -> TranslationResult:
         """简单的回退翻译：返回原文本并记录警告"""
-        logger.warning(f"使用回退翻译器：无可用的翻译服务，返回原文本")
+        logger.warning("使用回退翻译器：无可用的翻译服务，返回原文本")
         
         return TranslationResult(
             original_text=request.text,
@@ -467,7 +795,12 @@ class FallbackTranslator(TranslatorInterface):
             target_lang=request.target_lang,
             confidence=0.0,  # 低置信度表示这不是真正的翻译
             service="fallback",
-            metadata={"warning": "No translation service available"}
+            metadata={
+                "warning": "No translation service available; original text returned",
+                "error": "no_translation_service",
+                "success": False,
+                "fallback": True,
+            }
         )
     
     def translate_batch(self, requests: List[TranslationRequest]) -> List[TranslationResult]:
@@ -501,7 +834,13 @@ class TranslationManager:
         if primary_service:
             # Move primary service to front of priority list
             available_services = ["DeepL", "OpenAI", "Google", "Fallback"]
-            primary_service_title = primary_service.title()
+            provider_names = {
+                "deepl": "DeepL",
+                "openai": "OpenAI",
+                "google": "Google",
+                "fallback": "Fallback",
+            }
+            primary_service_title = provider_names.get(primary_service.lower())
             if primary_service_title in available_services:
                 self.service_priority = [primary_service_title] + [s for s in available_services if s != primary_service_title]
             else:
@@ -509,17 +848,29 @@ class TranslationManager:
                 self.service_priority = ["DeepL", "OpenAI", "Google", "Fallback"]
         else:
             self.service_priority = ["DeepL", "OpenAI", "Google", "Fallback"]
+
+    def close(self) -> None:
+        """Release the SQLite cache owned by this manager."""
+        self.cache.close()
     
     def _init_services(self):
         """Initialize available translation services."""
-        if "deepl" in self.api_keys:
-            self.services["DeepL"] = DeepLTranslator(self.api_keys["deepl"])
-        
-        # TODO: 实现 OpenAI 和 Google 翻译器
-        # if "openai" in self.api_keys:
-        #     self.services["OpenAI"] = OpenAITranslator(self.api_keys["openai"])
-        # if "google" in self.api_keys:
-        #     self.services["Google"] = GoogleTranslator(self.api_keys["google"])
+        normalized_keys = {
+            str(provider).lower(): value
+            for provider, value in self.api_keys.items()
+        }
+
+        if normalized_keys.get("deepl"):
+            self.services["DeepL"] = DeepLTranslator(normalized_keys["deepl"])
+
+        if normalized_keys.get("openai"):
+            self.services["OpenAI"] = OpenAITranslator(
+                normalized_keys["openai"],
+                model=normalized_keys.get("openai_model", "gpt-5.6-luna"),
+            )
+
+        if normalized_keys.get("google"):
+            self.services["Google"] = GoogleTranslator(normalized_keys["google"])
         
         # 总是添加回退翻译器作为最后的选择
         self.services["Fallback"] = FallbackTranslator()
@@ -547,15 +898,16 @@ class TranslationManager:
                 source_lang=source_lang,
                 target_lang=target_lang,
                 confidence=1.0,
-                service="passthrough"
+                service="passthrough",
+                metadata={"success": True, "fallback": False},
             )
         
         # Check cache first
         if use_cache:
             for service_name in self.service_priority:
-                if service_name in self.services:
+                if service_name in self.services and service_name != "Fallback":
                     cached_result = self.cache.get(text, source_lang, target_lang, service_name)
-                    if cached_result:
+                    if cached_result and cached_result.metadata.get("success", True):
                         logger.debug(f"Cache hit for '{text[:50]}...' using {service_name}")
                         return cached_result
         
@@ -583,8 +935,10 @@ class TranslationManager:
                     result.translated_text, source_lang, target_lang
                 )
                 
-                # Cache the result
-                if use_cache:
+                # Never cache a fallback passthrough as a successful
+                # translation. Doing so would mask a newly configured service
+                # on the next attempt.
+                if use_cache and result.metadata.get("success", True):
                     self.cache.store(result)
                 
                 logger.debug(f"Successfully translated using {service_name}")
@@ -603,7 +957,11 @@ class TranslationManager:
             target_lang=target_lang,
             confidence=0.0,
             service="emergency_fallback",
-            metadata={"error": "All services failed including fallback"}
+            metadata={
+                "error": "all_translation_services_failed",
+                "success": False,
+                "fallback": True,
+            }
         )
     
     def translate_batch(self, texts: List[str], source_lang: str = "auto",
@@ -638,16 +996,17 @@ class TranslationManager:
                     source_lang=source_lang,
                     target_lang=target_lang,
                     confidence=1.0,
-                    service="passthrough"
+                    service="passthrough",
+                    metadata={"success": True, "fallback": False},
                 ))
                 continue
             
             cached_result = None
             if use_cache:
                 for service_name in self.service_priority:
-                    if service_name in self.services:
+                    if service_name in self.services and service_name != "Fallback":
                         cached_result = self.cache.get(text, source_lang, target_lang, service_name)
-                        if cached_result:
+                        if cached_result and cached_result.metadata.get("success", True):
                             break
             
             if cached_result:
@@ -657,49 +1016,62 @@ class TranslationManager:
                 uncached_indices.append(i)
                 uncached_texts.append(text)
         
-        # Translate uncached texts
-        if uncached_texts:
-            logger.info(f"Translating {len(uncached_texts)} uncached texts")
-            
-            # Use the first available service for batch translation
-            service = None
-            for service_name in self.service_priority:
-                if service_name in self.services and self.services[service_name].is_available():
-                    service = self.services[service_name]
-                    break
-            
-            if service:
-                requests = [
-                    TranslationRequest(text=text, source_lang=source_lang, target_lang=target_lang)
-                    for text in uncached_texts
-                ]
-                
-                batch_results = service.translate_batch(requests)
-                
-                # Apply terminology and cache results
-                for i, result in enumerate(batch_results):
-                    result.translated_text = self.terminology.apply_terminology(
-                        result.translated_text, source_lang, target_lang
+        # Translate uncached texts, retrying only failed items with the next
+        # configured provider. This keeps native provider batch calls while
+        # preserving the manager's advertised service failover behavior.
+        remaining_indices = list(uncached_indices)
+        if remaining_indices:
+            logger.info(f"Translating {len(remaining_indices)} uncached texts")
+
+        for service_name in self.service_priority:
+            if not remaining_indices or service_name == "Fallback":
+                continue
+            service = self.services.get(service_name)
+            if service is None or not service.is_available():
+                continue
+
+            service_requests = [
+                TranslationRequest(
+                    text=texts[index],
+                    source_lang=source_lang,
+                    target_lang=target_lang,
+                )
+                for index in remaining_indices
+            ]
+            try:
+                batch_results = service.translate_batch(service_requests)
+                if len(batch_results) != len(service_requests):
+                    raise TranslationError(
+                        f"{service_name} returned {len(batch_results)} results "
+                        f"for {len(service_requests)} requests"
                     )
-                    
-                    if use_cache:
-                        self.cache.store(result)
-                    
-                    # Place result in correct position
-                    original_index = uncached_indices[i]
-                    results[original_index] = result
-            else:
-                # No service available - fill with fallback results
-                for i in uncached_indices:
-                    results[i] = TranslationResult(
-                        original_text=texts[i],
-                        translated_text=texts[i],
-                        source_lang=source_lang,
-                        target_lang=target_lang,
-                        confidence=0.0,
-                        service="fallback",
-                        metadata={"error": "No service available"}
-                    )
+            except Exception as exc:
+                logger.error(f"{service_name} batch translation failed: {exc}")
+                continue
+
+            failed_indices = []
+            for original_index, result in zip(remaining_indices, batch_results):
+                if not result.metadata.get("success", True):
+                    failed_indices.append(original_index)
+                    continue
+
+                result.translated_text = self.terminology.apply_terminology(
+                    result.translated_text, source_lang, target_lang
+                )
+                if use_cache:
+                    self.cache.store(result)
+                results[original_index] = result
+            remaining_indices = failed_indices
+
+        # A passthrough is retained for backward compatibility, but is
+        # explicitly machine-readable as a failed translation and is never
+        # cached. Callers can surface configuration/network failures instead of
+        # mistaking unchanged text for success.
+        fallback = self.services.get("Fallback", FallbackTranslator())
+        for index in remaining_indices:
+            results[index] = fallback.translate_single(
+                TranslationRequest(texts[index], source_lang, target_lang)
+            )
         
         return results
 

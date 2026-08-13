@@ -4,18 +4,22 @@
 Configuration management for VideoTranslator
 """
 
-import os
 import json
 import logging
-from typing import Dict, Any, Optional
+import os
+import tempfile
 from pathlib import Path
+from typing import Any, Dict, Optional
+
+from app.utils.paths import get_config_dir
 
 # 应用程序全局配置常量
 APP_NAME = "VideoTranslator"
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.0.0"
+KEYRING_SERVICE = "VideoTranslator"
 
 # 使用pathlib进行路径管理
-DEFAULT_BASE_DIR = Path.home() / ".videotranslator"
+DEFAULT_BASE_DIR = get_config_dir()
 CONFIG_FILE = DEFAULT_BASE_DIR / "config.json"
 
 # 支持的语言代码映射
@@ -79,7 +83,7 @@ class AppConfig:
         self.max_recent_files = 10
 
         # 界面配置
-        self.theme = "dark"
+        self.theme = "system"
         self.language = "zh-CN"
         self.window_size = [1200, 800]
         self.last_directory = str(Path.home())
@@ -88,6 +92,7 @@ class AppConfig:
         self.language_codes = LANGUAGE_CODES.copy()
         self.default_target_language = "zh-CN"
         self.default_source_language = "auto"
+        # 旧版本的 dark_mode 仅用于迁移；新代码统一读取 theme。
         self.dark_mode = False
 
     def get(self, key: str, default=None):
@@ -138,7 +143,7 @@ class AppConfig:
             'translation_provider': self.translation_provider,
             'source_language': self.source_language,
             'target_language': self.target_language,
-            'api_keys': self.api_keys,
+            # API 密钥只保存在系统钥匙串中，绝不写入配置 JSON。
             'recent_files': self.recent_files,
             'max_recent_files': self.max_recent_files,
             'theme': self.theme,
@@ -161,6 +166,24 @@ class AppConfig:
                     setattr(config, key, Path(value))
                 else:
                     setattr(config, key, value)
+        # Treat the JSON file as untrusted input.  Invalid UI preferences from
+        # an older or hand-edited config must not leave the application in a
+        # state that no settings control can represent.
+        if config.theme not in {"system", "light", "dark"}:
+            config.theme = "system"
+        provider = str(config.translation_provider).strip().lower()
+        config.translation_provider = (
+            provider if provider in TRANSLATION_PROVIDERS else "openai"
+        )
+        if not isinstance(config.recent_files, list):
+            config.recent_files = []
+        config.recent_files = [
+            str(path) for path in config.recent_files if isinstance(path, (str, Path))
+        ]
+        try:
+            config.max_recent_files = max(0, int(config.max_recent_files))
+        except (TypeError, ValueError):
+            config.max_recent_files = 10
         return config
 
 
@@ -168,17 +191,20 @@ class ConfigManager:
     """配置管理器"""
 
     def __init__(self, config_file: Optional[Path] = None):
-        self.config_file = config_file or CONFIG_FILE
+        self.config_file = Path(config_file or CONFIG_FILE).expanduser()
         self.config = AppConfig()
-        self._ensure_config_dir()
+        self.last_keyring_error: Optional[str] = None
+        try:
+            self._ensure_config_dir()
+        except OSError as exc:
+            # Keep in-memory defaults usable so startup can report the path
+            # problem instead of crashing before the GUI exists.
+            logging.warning("配置目录不可写，将使用本次会话配置: %s", exc)
         self.load_config()
 
     def _ensure_config_dir(self):
         """确保配置目录存在"""
         self.config_file.parent.mkdir(parents=True, exist_ok=True)
-        # 创建必要的子目录
-        self.config.temp_dir.mkdir(parents=True, exist_ok=True)
-        self.config.output_dir.mkdir(parents=True, exist_ok=True)
 
     def load_config(self) -> bool:
         """加载配置文件"""
@@ -186,10 +212,23 @@ class ConfigManager:
             if self.config_file.exists():
                 with open(self.config_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
+                legacy_keys = data.pop('api_keys', {}) or {}
                 self.config = AppConfig.from_dict(data)
+                if 'theme' not in data and data.get('dark_mode'):
+                    self.config.theme = 'dark'
+                for provider, key in legacy_keys.items():
+                    if key:
+                        self.set_api_key(provider, key, save_config=False)
+                self._load_api_keys_into_memory()
+                # The loaded config may choose a different private temp root.
+                Path(self.config.temp_dir).expanduser().mkdir(parents=True, exist_ok=True)
+                if legacy_keys:
+                    # 迁移后立即重写，移除旧配置中的明文密钥。
+                    self.save_config()
                 logging.info(f"配置已从 {self.config_file} 加载")
             else:
                 logging.info("配置文件不存在，使用默认配置")
+                Path(self.config.temp_dir).expanduser().mkdir(parents=True, exist_ok=True)
                 self.save_config()
             return True
         except Exception as e:
@@ -202,8 +241,27 @@ class ConfigManager:
         try:
             config_to_save = config or self.config
             self._ensure_config_dir()
-            with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump(config_to_save.to_dict(), f, ensure_ascii=False, indent=2)
+            payload = config_to_save.to_dict()
+            temp_name = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode='w', encoding='utf-8', dir=self.config_file.parent,
+                    prefix=f".{self.config_file.name}.", suffix='.tmp', delete=False
+                ) as f:
+                    temp_name = f.name
+                    json.dump(payload, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                try:
+                    os.chmod(temp_name, 0o600)
+                except OSError:
+                    # Some Windows/network filesystems do not implement POSIX
+                    # modes; the containing application directory is private.
+                    pass
+                os.replace(temp_name, self.config_file)
+            finally:
+                if temp_name and os.path.exists(temp_name):
+                    os.unlink(temp_name)
             logging.info(f"配置已保存到 {self.config_file}")
             return True
         except Exception as e:
@@ -212,24 +270,78 @@ class ConfigManager:
 
     def get_api_key(self, provider: str) -> str:
         """获取API密钥"""
-        return self.config.api_keys.get(provider, "")
-
-    def set_api_key(self, provider: str, key: str) -> bool:
-        """设置API密钥"""
+        provider = provider.strip().lower()
+        if provider in self.config.api_keys:
+            return self.config.api_keys[provider]
+        env_name = f"VIDEOTRANSLATOR_{provider.upper()}_API_KEY"
+        env_value = os.environ.get(env_name, "")
+        if env_value:
+            self.config.api_keys[provider] = env_value
+            return env_value
         try:
-            self.config.api_keys[provider] = key
-            return self.save_config()
+            import keyring
+            value = keyring.get_password(KEYRING_SERVICE, provider) or ""
+        except Exception as exc:
+            logging.debug("系统钥匙串不可用: %s", exc)
+            value = ""
+        if value:
+            self.config.api_keys[provider] = value
+        return value
+
+    def set_api_key(self, provider: str, key: str, save_config: bool = True) -> bool:
+        """Store an API key in the OS keyring.
+
+        The return value describes keyring persistence only.  If the keyring
+        is unavailable the value remains usable for this process, the method
+        returns ``False``, and it is still never serialized to ``config.json``.
+        """
+        provider = provider.strip().lower()
+        key = key.strip()
+        self.last_keyring_error = None
+        try:
+            import keyring
+            if key:
+                keyring.set_password(KEYRING_SERVICE, provider, key)
+                self.config.api_keys[provider] = key
+            else:
+                try:
+                    keyring.delete_password(KEYRING_SERVICE, provider)
+                except keyring.errors.PasswordDeleteError:
+                    pass
+                self.config.api_keys.pop(provider, None)
         except Exception as e:
-            logging.error(f"设置API密钥失败: {e}")
+            # 保留本次会话可用性，但不降级为明文落盘。
+            if key:
+                self.config.api_keys[provider] = key
+            else:
+                self.config.api_keys.pop(provider, None)
+            self.last_keyring_error = str(e)
+            logging.warning("系统钥匙串不可用，API 密钥仅在本次会话有效: %s", e)
+            if save_config:
+                self.save_config()
             return False
+        if save_config and not self.save_config():
+            # The secret itself is already safely persisted.  A failure to
+            # rewrite non-secret preferences must not be reported as a
+            # keyring failure, but is still visible in the log.
+            logging.error("API 密钥已保存，但配置文件写入失败")
+        return True
+
+    def _load_api_keys_into_memory(self) -> None:
+        for provider in TRANSLATION_PROVIDERS:
+            self.get_api_key(provider)
 
     def add_recent_file(self, file_path: str) -> bool:
         """添加最近文件"""
         try:
-            file_path = str(Path(file_path).resolve())
-            # 移除重复项
-            if file_path in self.config.recent_files:
-                self.config.recent_files.remove(file_path)
+            file_path = str(Path(file_path).expanduser().resolve())
+            path_key = os.path.normcase(file_path)
+            # Normalize historical relative entries while removing duplicates.
+            self.config.recent_files = [
+                existing
+                for existing in self.config.recent_files
+                if os.path.normcase(str(Path(existing).expanduser().resolve())) != path_key
+            ]
             # 添加到开头
             self.config.recent_files.insert(0, file_path)
             # 限制数量

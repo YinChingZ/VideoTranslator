@@ -5,13 +5,12 @@
 用于处理各种失败场景的自动恢复
 """
 
-import time
 import logging
-import asyncio
-from typing import Callable, Optional, Any, Dict, List
+import time
+from dataclasses import dataclass
 from enum import Enum
 from functools import wraps
-from dataclasses import dataclass
+from typing import Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -285,7 +284,6 @@ def recover_file_not_found(error: FileNotFoundError, context: Dict) -> bool:
         return False
     
     # 尝试在常见位置查找文件
-    import os
     from pathlib import Path
     
     search_paths = [
@@ -338,7 +336,7 @@ def recover_connection_error(error: Exception, context: Dict) -> bool:
         socket.create_connection(("8.8.8.8", 53), timeout=5)
         logger.info("网络连接正常，错误可能是临时的")
         return True
-    except:
+    except OSError:
         logger.warning("网络连接异常，请检查网络设置")
         return False
 

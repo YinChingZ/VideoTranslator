@@ -61,8 +61,9 @@ class TestSubtitleGenerationFix(unittest.TestCase):
             self.fail(f"字幕生成失败: {e}")
     
     def test_os_path_basename_with_string(self):
-        """测试 os.path.basename 与字符串参数"""
+        """测试 POSIX 和 Windows 路径的 basename 规则。"""
         import os
+        import ntpath
         
         # 测试字符串路径
         test_path = "/tmp/test_subtitles.srt"
@@ -71,7 +72,7 @@ class TestSubtitleGenerationFix(unittest.TestCase):
         
         # 测试 Windows 路径
         test_path_win = "C:\\temp\\test_subtitles.srt"
-        basename_win = os.path.basename(test_path_win)
+        basename_win = ntpath.basename(test_path_win)
         self.assertEqual(basename_win, "test_subtitles.srt")
         
         print("✓ os.path.basename 与字符串参数正常工作")

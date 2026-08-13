@@ -5,17 +5,25 @@
 在应用启动前进行全面的系统检查
 """
 
-import os
-import sys
+import importlib.util
+import json
 import logging
+import os
 import platform
 import shutil
-import socket
 import subprocess
-import importlib.util
-from typing import Dict, List, Tuple, Optional, Any
+import sys
+import tempfile
 from pathlib import Path
-import json
+from typing import Any, Dict
+
+from app.utils.paths import (
+    ensure_private_directory,
+    get_cache_dir,
+    get_config_dir,
+    get_state_dir,
+    get_whisper_model_dir,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +40,10 @@ class SystemHealthChecker:
     def run_full_check(self) -> Dict[str, Any]:
         """运行完整的系统检查"""
         logger.info("开始系统健康检查...")
+        self.check_results.clear()
+        self.issues.clear()
+        self.warnings.clear()
+        self.recommendations.clear()
         
         # 执行各项检查
         checks = [
@@ -39,7 +51,6 @@ class SystemHealthChecker:
             ("系统资源", self.check_system_resources),
             ("依赖包", self.check_python_packages),
             ("外部工具", self.check_external_tools),
-            ("网络连接", self.check_network_connectivity),
             ("文件系统", self.check_file_system),
             ("配置文件", self.check_configuration),
             ("模型文件", self.check_model_files),
@@ -79,9 +90,9 @@ class SystemHealthChecker:
         python_version = sys.version_info
         result['details']['python_version'] = f"{python_version.major}.{python_version.minor}.{python_version.micro}"
         
-        if python_version < (3, 8):
+        if python_version < (3, 11):
             result['status'] = False
-            result['message'] = f"Python版本过低: {result['details']['python_version']}，需要3.8+版本"
+            result['message'] = f"Python版本过低: {result['details']['python_version']}，需要3.11+版本"
             return result
         
         # 平台信息
@@ -118,13 +129,18 @@ class SystemHealthChecker:
                 result['warnings'].append("可用内存不足2GB，处理大文件时可能遇到问题")
             
             # 磁盘空间检查
-            disk_usage = psutil.disk_usage('/')
+            # Check the volume that actually stores runtime state. On Windows
+            # ``/`` is not a reliable drive target, and overrides may place
+            # caches on a different volume from the executable.
+            state_dir = ensure_private_directory(get_state_dir())
+            disk_usage = psutil.disk_usage(str(state_dir))
             result['details']['disk'] = {
                 'total': disk_usage.total,
                 'used': disk_usage.used,
                 'free': disk_usage.free,
                 'percent': (disk_usage.used / disk_usage.total) * 100,
-                'free_gb': round(disk_usage.free / (1024**3), 2)
+                'free_gb': round(disk_usage.free / (1024**3), 2),
+                'path': str(state_dir),
             }
             
             if disk_usage.free < 5 * 1024**3:  # 少于5GB空闲空间
@@ -151,20 +167,21 @@ class SystemHealthChecker:
         required_packages = {
             'PyQt5': ('PyQt5', 'GUI框架'),
             'numpy': ('numpy', '数值计算'),
-            'torch': ('torch', '深度学习框架'),
-            'librosa': ('librosa', '音频处理'),
-            'pydub': ('pydub', '音频处理'),
             'ffmpeg-python': ('ffmpeg', '音视频处理'),
+            'pysrt': ('pysrt', 'SRT字幕'),
+            'webvtt-py': ('webvtt', 'WebVTT字幕'),
+            'chardet': ('chardet', '字符编码检测'),
             'requests': ('requests', 'HTTP客户端'),
-            'opencv-python': ('cv2', '计算机视觉'),
+            'soundfile': ('soundfile', '流式音频读写'),
         }
         
         # 可选的包
         optional_packages = {
+            'librosa': ('librosa', '音频重采样'),
+            'pydub': ('pydub', '静音分段'),
+            'python-vlc': ('vlc', '实时视频预览'),
             'psutil': ('psutil', '系统监控'),
             'scipy': ('scipy', '科学计算'),
-            'matplotlib': ('matplotlib', '绘图'),
-            'pillow': ('PIL', '图像处理')
         }
         
         # 检查必需包
@@ -174,20 +191,10 @@ class SystemHealthChecker:
                 if spec is None:
                     result['missing'].append(f"{package_name} ({description})")
                 else:
-                    try:
-                        module = importlib.import_module(import_name)
-                        version = getattr(module, '__version__', 'unknown')
-                        result['details'][package_name] = {
-                            'installed': True,
-                            'version': version,
-                            'description': description
-                        }
-                    except:
-                        result['details'][package_name] = {
-                            'installed': True,
-                            'version': 'unknown',
-                            'description': description
-                        }
+                    result['details'][package_name] = {
+                        'installed': True,
+                        'description': description,
+                    }
             except Exception as e:
                 result['missing'].append(f"{package_name} ({description}) - 检查失败: {e}")
         
@@ -198,22 +205,27 @@ class SystemHealthChecker:
                 if spec is None:
                     result['warnings'].append(f"可选包 {package_name} 未安装，{description}功能可能受限")
                 else:
-                    try:
-                        module = importlib.import_module(import_name)
-                        version = getattr(module, '__version__', 'unknown')
-                        result['details'][package_name] = {
-                            'installed': True,
-                            'version': version,
-                            'description': description
-                        }
-                    except:
-                        result['details'][package_name] = {
-                            'installed': True,
-                            'version': 'unknown',
-                            'description': description
-                        }
+                    result['details'][package_name] = {
+                        'installed': True,
+                        'description': description,
+                    }
             except Exception as e:
                 result['warnings'].append(f"检查可选包 {package_name} 时发生错误: {e}")
+
+        # Whisper imports torch. Checking it as a regular module would report
+        # both packages missing (or trigger a heavyweight torch import) when
+        # the optional speech extra is intentionally not installed.
+        whisper_spec = importlib.util.find_spec('whisper')
+        torch_spec = importlib.util.find_spec('torch')
+        if whisper_spec is None or torch_spec is None:
+            result['warnings'].append(
+                "未安装可选语音识别组件；运行 pip install '.[speech]' 可启用 Whisper"
+            )
+        else:
+            result['details']['speech'] = {
+                'installed': True,
+                'description': 'Whisper 语音识别',
+            }
         
         if result['missing']:
             result['status'] = False
@@ -223,7 +235,7 @@ class SystemHealthChecker:
     
     def check_external_tools(self) -> Dict[str, Any]:
         """检查外部工具"""
-        result = {'status': True, 'details': {}, 'missing': []}
+        result = {'status': True, 'details': {}, 'missing': [], 'warnings': []}
         
         # 必需的外部工具
         required_tools = {
@@ -266,53 +278,33 @@ class SystemHealthChecker:
             except Exception as e:
                 result['missing'].append(f"{tool} ({description}) - 检查失败: {e}")
         
+        if 'ffmpeg' in result['details']:
+            from app.core.video import VideoProcessor
+
+            filters = VideoProcessor.ffmpeg_filter_names(
+                result['details']['ffmpeg']['path']
+            )
+            hard_subtitle_filters = {
+                name: name in filters for name in ('subtitles', 'ass')
+            }
+            result['details']['hard_subtitles'] = {
+                'available': all(hard_subtitle_filters.values()),
+                'filters': hard_subtitle_filters,
+                'description': '硬字幕渲染（可选，需要 libass）',
+            }
+            missing_filters = [
+                name for name, available in hard_subtitle_filters.items() if not available
+            ]
+            if missing_filters:
+                result['warnings'].append(
+                    f"当前 FFmpeg 缺少 {', '.join(missing_filters)} 字幕滤镜；"
+                    "软字幕导出仍可用。若需烧入硬字幕，请安装启用 libass 的 "
+                    "FFmpeg 构建，并用 `ffmpeg -filters` 确认 subtitles/ass 可见"
+                )
+
         if result['missing']:
             result['status'] = False
             result['message'] = f"缺少必需的外部工具: {', '.join(result['missing'])}"
-        
-        return result
-    
-    def check_network_connectivity(self) -> Dict[str, Any]:
-        """检查网络连接"""
-        result = {'status': True, 'details': {}, 'warnings': []}
-        
-        # 测试连接
-        test_hosts = [
-            ('google.com', 80, 'Google'),
-            ('api.openai.com', 443, 'OpenAI API'),
-            ('translate.googleapis.com', 443, 'Google Translate API'),
-            ('github.com', 443, 'GitHub')
-        ]
-        
-        connected_hosts = []
-        failed_hosts = []
-        
-        for host, port, description in test_hosts:
-            try:
-                sock = socket.create_connection((host, port), timeout=5)
-                sock.close()
-                connected_hosts.append(description)
-                result['details'][host] = {
-                    'reachable': True,
-                    'description': description
-                }
-            except Exception as e:
-                failed_hosts.append(f"{description} ({host}:{port})")
-                result['details'][host] = {
-                    'reachable': False,
-                    'description': description,
-                    'error': str(e)
-                }
-        
-        if failed_hosts:
-            result['warnings'].append(f"无法连接到: {', '.join(failed_hosts)}")
-            result['warnings'].append("网络连接问题可能影响翻译服务和模型下载")
-        
-        result['details']['summary'] = {
-            'connected': len(connected_hosts),
-            'failed': len(failed_hosts),
-            'total': len(test_hosts)
-        }
         
         return result
     
@@ -320,29 +312,27 @@ class SystemHealthChecker:
         """检查文件系统"""
         result = {'status': True, 'details': {}, 'warnings': []}
         
-        # 检查重要目录
+        # Only user-writable platform locations are touched. Installed source
+        # trees may be read-only and must never accumulate runtime artifacts.
         important_dirs = [
-            ('temp', '临时文件目录'),
-            ('models', '模型文件目录'),
-            ('logs', '日志文件目录')
+            ('config', get_config_dir(), '应用配置目录'),
+            ('cache', get_cache_dir(), '应用缓存目录'),
+            ('models', get_whisper_model_dir(), 'Whisper模型目录'),
+            ('state', get_state_dir(), '日志与诊断报告目录'),
         ]
         
-        for dir_name, description in important_dirs:
+        for dir_name, dir_path, description in important_dirs:
             try:
-                # 获取项目根目录
-                project_root = Path(__file__).parents[2]
-                dir_path = project_root / dir_name
-                
-                # 检查目录是否存在，不存在则创建
-                if not dir_path.exists():
-                    dir_path.mkdir(parents=True, exist_ok=True)
-                    result['warnings'].append(f"创建了缺失的目录: {dir_path}")
+                ensure_private_directory(dir_path)
                 
                 # 检查写权限
-                test_file = dir_path / '.write_test'
+                test_file = None
                 try:
-                    test_file.write_text('test')
-                    test_file.unlink()
+                    descriptor, test_value = tempfile.mkstemp(
+                        prefix='.videotranslator-write-test-', dir=dir_path
+                    )
+                    os.close(descriptor)
+                    test_file = Path(test_value)
                     result['details'][dir_name] = {
                         'exists': True,
                         'writable': True,
@@ -358,6 +348,12 @@ class SystemHealthChecker:
                         'error': str(e)
                     }
                     result['warnings'].append(f"目录 {dir_path} 无写权限")
+                finally:
+                    if test_file is not None:
+                        try:
+                            test_file.unlink(missing_ok=True)
+                        except OSError:
+                            pass
                     
             except Exception as e:
                 result['details'][dir_name] = {
@@ -382,6 +378,10 @@ class SystemHealthChecker:
             
             result['details']['config_loaded'] = config_loaded
             result['details']['config_path'] = str(config_manager.config_file)
+            if not config_loaded:
+                result['warnings'].append(
+                    "配置文件无法读取或保存，本次会话将使用默认设置"
+                )
             
             # 检查关键配置项
             key_configs = [
@@ -419,8 +419,7 @@ class SystemHealthChecker:
         
         # 检查Whisper模型目录
         try:
-            project_root = Path(__file__).parents[2]
-            whisper_models_dir = project_root / "model" / "whisper" / "models"
+            whisper_models_dir = get_whisper_model_dir()
             
             result['details']['whisper_models_dir'] = {
                 'exists': whisper_models_dir.exists(),
@@ -496,13 +495,25 @@ class SystemHealthChecker:
             filename = f"system_health_check_{timestamp}.json"
         
         try:
-            project_root = Path(__file__).parents[2]
-            logs_dir = project_root / "logs"
-            logs_dir.mkdir(exist_ok=True)
+            logs_dir = ensure_private_directory(get_state_dir() / "logs")
             
-            report_path = logs_dir / filename
-            with open(report_path, 'w', encoding='utf-8') as f:
-                json.dump(report, f, ensure_ascii=False, indent=2, default=str)
+            report_path = logs_dir / Path(filename).name
+            descriptor, temporary_value = tempfile.mkstemp(
+                prefix=f".{report_path.name}.", suffix=".tmp", dir=logs_dir
+            )
+            temporary_path = Path(temporary_value)
+            try:
+                with os.fdopen(descriptor, 'w', encoding='utf-8') as f:
+                    json.dump(report, f, ensure_ascii=False, indent=2, default=str)
+                    f.flush()
+                    os.fsync(f.fileno())
+                try:
+                    temporary_path.chmod(0o600)
+                except OSError:
+                    pass
+                os.replace(temporary_path, report_path)
+            finally:
+                temporary_path.unlink(missing_ok=True)
             
             logger.info(f"系统健康检查报告已保存到: {report_path}")
             return str(report_path)
@@ -518,7 +529,7 @@ def perform_startup_check() -> Dict[str, Any]:
     report = checker.run_full_check()
     
     # 保存报告
-    checker.save_report(report)
+    report["report_path"] = checker.save_report(report)
     
     return report
 
@@ -533,7 +544,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     report = perform_startup_check()
     
-    print(f"\n系统健康检查完成!")
+    print("\n系统健康检查完成!")
     print(f"状态: {report['status_message']}")
     print(f"成功率: {report['success_rate']}%")
     
@@ -548,7 +559,7 @@ if __name__ == "__main__":
             print(f"  ⚠ {warning}")
     
     if report['recommendations']:
-        print(f"\n建议:")
+        print("\n建议:")
         for rec in report['recommendations']:
             print(f"  {rec}")
     

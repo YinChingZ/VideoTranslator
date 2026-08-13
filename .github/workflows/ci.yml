@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Python 3.11 quality gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      QT_QPA_PLATFORM: offscreen
+      MPLBACKEND: Agg
+      PYTHON_KEYRING_BACKEND: keyring.backends.null.Keyring
+      DIST_DIR: ${{ runner.temp }}/video-translator-dist
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install application and test dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -e '.[dev]'
+
+      - name: Reject correctness errors
+        run: |
+          ruff check app main.py scripts
+          ruff check tests/release tests/unit/test_packaging_contract.py
+          ruff check --select E9,F63,F7,F82 tests
+
+      - name: Run trusted unit suite
+        run: pytest -q
+
+      - name: Build release wheel
+        # Building the wheel from the freshly created sdist prevents stale,
+        # ignored files in a local build/ directory from leaking into it.
+        run: python -m build --outdir "$DIST_DIR"
+
+      - name: Audit wheel contents and metadata
+        run: python tests/release/verify_wheel.py "$DIST_DIR"/*.whl
+
+      - name: Smoke-test a clean base installation
+        run: |
+          python -m venv "$RUNNER_TEMP/video-translator-wheel-smoke"
+          "$RUNNER_TEMP/video-translator-wheel-smoke/bin/python" -m pip install "$DIST_DIR"/*.whl
+          "$RUNNER_TEMP/video-translator-wheel-smoke/bin/python" -m pip check
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/video-translator-wheel-smoke/bin/python" \
+            "$GITHUB_WORKSPACE/tests/release/smoke_installed.py"

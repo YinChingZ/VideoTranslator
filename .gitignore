@@ -26,6 +26,7 @@ venv/
 env/
 ENV/
 .venv/
+.python/
 .env/
 
 # IDE

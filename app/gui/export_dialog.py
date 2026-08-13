@@ -1,20 +1,26 @@
-import os
 import logging
+import os
 import re
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, Optional
 
 from PyQt5.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
-    QFileDialog, QCheckBox, QLineEdit, QFormLayout, QGroupBox,
-    QDialogButtonBox, QProgressBar, QRadioButton, QButtonGroup, QSpacerItem,
-    QSizePolicy, QMessageBox
+    QButtonGroup,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QRadioButton,
+    QVBoxLayout,
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QSize, QTimer
-from PyQt5.QtGui import QIcon
-
-from app.core.subtitle import SubtitleProcessor
-from app.resources.icons import IconManager
 
 # 创建日志记录器
 logger = logging.getLogger(__name__)
@@ -23,13 +29,11 @@ logger = logging.getLogger(__name__)
 class ExportDialog(QDialog):
     """导出选项对话框"""
     
-    # 信号：导出进度更新
-    progress_updated = pyqtSignal(int, str)
-    
     def __init__(self, parent, config: Dict[str, Any], video_path: str):
         super().__init__(parent)
         self.config = config
         self.video_path = video_path
+        self.overwrite_confirmed = False
         # 使用父窗口的 IconManager 实例
         self.icon_manager = parent.icon_manager
         
@@ -57,6 +61,7 @@ class ExportDialog(QDialog):
         self.output_path_label = QLabel("输出目录:")
         self.output_path_edit = QLineEdit()
         self.output_path_edit.setReadOnly(True)
+        self.output_path_edit.setAccessibleName("导出目录")
         
         path_layout = QHBoxLayout()
         path_layout.addWidget(self.output_path_edit)
@@ -71,6 +76,7 @@ class ExportDialog(QDialog):
         self.filename_label = QLabel("文件名模板:")
         self.filename_edit = QLineEdit()
         self.filename_edit.setPlaceholderText("例如: {original_name}_translated")
+        self.filename_edit.setAccessibleName("导出文件名")
         form_layout.addRow(self.filename_label, self.filename_edit)
         
         # 添加模板帮助标签
@@ -94,6 +100,9 @@ class ExportDialog(QDialog):
         self.format_combo.addItem("WebVTT 格式 (.vtt)", "vtt")
         self.format_combo.addItem("Advanced SubStation Alpha (.ass)", "ass")
         self.format_combo.addItem("SubStation Alpha (.ssa)", "ssa")
+        self.format_combo.addItem("YouTube SBV (.sbv)", "sbv")
+        self.format_combo.addItem("MicroDVD (.sub)", "sub")
+        self.format_combo.setAccessibleName("字幕导出格式")
         
         subtitle_layout.addWidget(self.format_label)
         subtitle_layout.addWidget(self.format_combo)
@@ -110,6 +119,8 @@ class ExportDialog(QDialog):
         self.video_format_combo = QComboBox()
         self.video_format_combo.addItem("MP4", "mp4")
         self.video_format_combo.addItem("MKV", "mkv")
+        self.video_format_combo.addItem("MOV", "mov")
+        self.video_format_combo.addItem("WebM", "webm")
         self.video_format_combo.addItem("与源格式相同", "same")
         self.video_format_combo.setEnabled(False)  # 初始禁用
         
@@ -128,9 +139,9 @@ class ExportDialog(QDialog):
         content_group = QGroupBox("字幕内容选项")
         content_layout = QVBoxLayout(content_group)
         
-        # 包含原文
+        # 保留旧控件属性用于兼容，但统一由下面的语言模式控制。
         self.include_original_checkbox = QCheckBox("在字幕中包含原文")
-        content_layout.addWidget(self.include_original_checkbox)
+        self.include_original_checkbox.setVisible(False)
         
         # 语言选项
         lang_layout = QHBoxLayout()
@@ -145,6 +156,11 @@ class ExportDialog(QDialog):
         self.lang_group.addButton(self.lang_original_radio, 1)
         self.lang_group.addButton(self.lang_translation_radio, 2)
         self.lang_group.addButton(self.lang_both_radio, 3)
+        self.lang_group.buttonClicked.connect(
+            lambda: self.include_original_checkbox.setChecked(
+                self.lang_group.checkedId() == 3
+            )
+        )
         
         lang_layout.addWidget(self.lang_label)
         lang_layout.addWidget(self.lang_original_radio)
@@ -155,20 +171,6 @@ class ExportDialog(QDialog):
         
         main_layout.addWidget(content_group)
         
-        # 进度条（初始隐藏）
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(True)
-        self.progress_bar.setVisible(False)
-        main_layout.addWidget(self.progress_bar)
-        
-        # 状态标签（初始隐藏）
-        self.status_label = QLabel("")
-        self.status_label.setVisible(False)
-        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        main_layout.addWidget(self.status_label)
-        
         # 对话框按钮
         self.button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         self.button_box.button(QDialogButtonBox.StandardButton.Ok).setText("导出")
@@ -178,7 +180,8 @@ class ExportDialog(QDialog):
     def setup_connections(self):
         """设置信号和槽连接"""
         self.browse_btn.clicked.connect(self.browse_output_dir)
-        self.embed_checkbox.toggled.connect(self.video_format_combo.setEnabled)
+        self.embed_checkbox.toggled.connect(self._update_video_format_enabled)
+        self.hardcode_checkbox.toggled.connect(self._update_video_format_enabled)
         
         # 切换字幕格式时禁用不兼容的选项
         self.format_combo.currentIndexChanged.connect(self.update_ui_based_on_format)
@@ -186,9 +189,6 @@ class ExportDialog(QDialog):
         # 互斥选项
         self.hardcode_checkbox.toggled.connect(self.handle_hardcode_toggled)
         self.embed_checkbox.toggled.connect(self.handle_embed_toggled)
-        
-        # 导出进度信号
-        self.progress_updated.connect(self.update_progress)
         
         # 对话框按钮
         self.button_box.accepted.connect(self.accept)
@@ -224,6 +224,47 @@ class ExportDialog(QDialog):
         
         # 默认双语字幕
         self.include_original_checkbox.setChecked(True)
+
+    def accept(self):
+        """校验目标和覆盖行为后再关闭对话框。"""
+        self.overwrite_confirmed = False
+        options = self.get_export_options()
+        output_dir = options['output_dir']
+        if not output_dir:
+            QMessageBox.warning(self, "无法导出", "请选择输出目录。")
+            return
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(self, "无法导出", f"无法创建输出目录：\n{exc}")
+            return
+        if not os.path.isdir(output_dir) or not os.access(output_dir, os.W_OK):
+            QMessageBox.warning(self, "无法导出", "输出目录不存在或不可写。")
+            return
+        if not options['filename'] or options['filename'] in {'.', '..'}:
+            QMessageBox.warning(self, "无法导出", "请输入有效的文件名。")
+            return
+
+        if options['embed_subtitles'] or options['hardcode_subtitles']:
+            extension = options.get('video_format', 'mp4')
+            if extension == 'same':
+                extension = (
+                    os.path.splitext(self.video_path)[1].lstrip('.').lower() or 'mp4'
+                )
+        else:
+            extension = options['format']
+        destination = os.path.join(output_dir, f"{options['filename']}.{extension}")
+        if os.path.exists(destination):
+            answer = QMessageBox.question(
+                self, "确认覆盖",
+                f"目标文件已存在：\n{destination}\n\n是否覆盖？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            self.overwrite_confirmed = True
+        super().accept()
     
     def browse_output_dir(self):
         """浏览并选择输出目录"""
@@ -242,15 +283,23 @@ class ExportDialog(QDialog):
             self.output_path_edit.setText(dir_path)
     
     def update_ui_based_on_format(self):
-        """基于所选格式更新UI选项"""
+        """Keep video controls aligned with FFmpeg subtitle input support."""
         current_format = self.format_combo.currentData()
-        
-        # 某些格式可能不支持特定功能
-        if current_format in ["srt", "vtt"]:
-            self.embed_checkbox.setEnabled(True)
-        else:
-            # ASS/SSA格式可能有特殊考虑
-            pass
+
+        video_compatible = current_format in {"srt", "vtt", "ass", "ssa"}
+        if not video_compatible:
+            self.embed_checkbox.setChecked(False)
+            self.hardcode_checkbox.setChecked(False)
+        self.embed_checkbox.setEnabled(video_compatible)
+        self.hardcode_checkbox.setEnabled(video_compatible)
+        explanation = (
+            ""
+            if video_compatible
+            else "SBV/MicroDVD 仅用于导出字幕文件；如需视频字幕请选 SRT、VTT 或 ASS。"
+        )
+        self.embed_checkbox.setToolTip(explanation)
+        self.hardcode_checkbox.setToolTip(explanation)
+        self._update_video_format_enabled()
     
     def handle_hardcode_toggled(self, checked: bool):
         """处理烧入字幕选项切换"""
@@ -263,37 +312,12 @@ class ExportDialog(QDialog):
         if checked:
             # 如果选择嵌入字幕，则禁用烧入字幕（互斥）
             self.hardcode_checkbox.setChecked(False)
-    
-    def update_progress(self, percent: int, message: str):
-        """更新进度条和状态消息"""
-        if not self.progress_bar.isVisible():
-            self.progress_bar.setVisible(True)
-            self.status_label.setVisible(True)
-            # 禁用表单元素
-            self.setFormEnabled(False)
-            
-        self.progress_bar.setValue(percent)
-        self.status_label.setText(message)
-        
-        # 如果完成，重新启用表单
-        if percent >= 100:
-            self.setFormEnabled(True)
-            # 延迟一段时间后隐藏进度条
-            QTimer.singleShot(3000, lambda: self.progress_bar.setVisible(False))
-    
-    def setFormEnabled(self, enabled: bool):
-        """启用或禁用表单元素"""
-        self.browse_btn.setEnabled(enabled)
-        self.filename_edit.setEnabled(enabled)
-        self.format_combo.setEnabled(enabled)
-        self.embed_checkbox.setEnabled(enabled)
-        self.video_format_combo.setEnabled(enabled and self.embed_checkbox.isChecked())
-        self.hardcode_checkbox.setEnabled(enabled)
-        self.include_original_checkbox.setEnabled(enabled)
-        self.lang_original_radio.setEnabled(enabled)
-        self.lang_translation_radio.setEnabled(enabled)
-        self.lang_both_radio.setEnabled(enabled)
-        self.button_box.button(QDialogButtonBox.StandardButton.Ok).setEnabled(enabled)
+
+    def _update_video_format_enabled(self):
+        self.video_format_combo.setEnabled(
+            (self.embed_checkbox.isChecked() or self.hardcode_checkbox.isChecked())
+            and self.format_combo.currentData() in {"srt", "vtt", "ass", "ssa"}
+        )
     
     def get_export_options(self) -> Dict[str, Any]:
         """
@@ -318,7 +342,7 @@ class ExportDialog(QDialog):
         filename = filename.replace("{target_lang}", target_lang)
         
         # 清理文件名，移除非法字符
-        filename = re.sub(r'[\\/*?:"<>|]', "_", filename)
+        filename = re.sub(r'[\\/*?:"<>|]', "_", filename).strip().rstrip('.')
         
         # 获取输出目录
         output_dir = self.output_path_edit.text()
@@ -342,12 +366,14 @@ class ExportDialog(QDialog):
             "format": subtitle_format,
             "embed_subtitles": self.embed_checkbox.isChecked(),
             "hardcode_subtitles": self.hardcode_checkbox.isChecked(),
-            "include_original": self.include_original_checkbox.isChecked(),
-            "language_option": language_option
+            "include_original": language_option == "bilingual",
+            "language_option": language_option,
+            # Only an explicit confirmation permits replacing an existing file.
+            "overwrite_existing": self.overwrite_confirmed,
         }
         
         # 如果嵌入字幕，添加视频格式
-        if self.embed_checkbox.isChecked():
+        if self.embed_checkbox.isChecked() or self.hardcode_checkbox.isChecked():
             options["video_format"] = self.video_format_combo.currentData()
         
         return options
@@ -389,8 +415,8 @@ class ExportDialog(QDialog):
             path: 文件或目录路径
         """
         try:
-            import subprocess
             import platform
+            import subprocess
             
             if platform.system() == "Windows":
                 os.startfile(path)

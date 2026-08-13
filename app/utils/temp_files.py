@@ -1,12 +1,13 @@
-import os
-import uuid
-import shutil
 import logging
+import os
+import shutil
 import tempfile
 import time
-from typing import List, Optional, Dict
-from pathlib import Path
+import uuid
+from typing import Dict, Optional
+
 import psutil
+
 
 class TempFileManager:
     """临时文件管理器，处理临时文件和目录的创建、追踪和删除"""

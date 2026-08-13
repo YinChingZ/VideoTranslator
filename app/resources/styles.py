@@ -1,615 +1,538 @@
+"""Application theme tokens and Qt stylesheet generation.
+
+The application deliberately keeps typography native: Qt chooses the platform
+UI font, which provides better CJK coverage and accessibility than a hard-coded
+font family.  Colours are centralized here so widgets and generated icons share
+the same light/dark vocabulary.
+"""
+
+from __future__ import annotations
+
 import logging
-import platform
-from typing import Dict, Any, Optional
+from typing import Dict, Mapping, Optional
+
+from PyQt5.QtGui import QColor, QPalette
 from PyQt5.QtWidgets import QApplication, QWidget
-from PyQt5.QtGui import QPalette, QColor
 
-# 定义颜色方案常量
-LIGHT_THEME = {
-    'primary': '#3498db',      # 主色
-    'secondary': '#2ecc71',    # 次要色
-    'background': '#f5f5f5',   # 背景色
-    'text': '#333333',         # 文本色
-    'accent': '#9b59b6',       # 强调色
-    'warning': '#f39c12',      # 警告色
-    'error': '#e74c3c',        # 错误色
-    'success': '#2ecc71',      # 成功色
+LIGHT_THEME: Dict[str, str] = {
+    "primary": "#2563EB",
+    "primary_hover": "#1D4ED8",
+    "primary_pressed": "#1E40AF",
+    "primary_soft": "#DBEAFE",
+    "secondary": "#0F766E",
+    "background": "#F6F7FB",
+    "surface": "#FFFFFF",
+    "surface_alt": "#F1F5F9",
+    "surface_hover": "#E8EEF7",
+    "text": "#172033",
+    "text_muted": "#566176",
+    "text_on_primary": "#FFFFFF",
+    "border": "#CBD5E1",
+    "border_strong": "#94A3B8",
+    "focus": "#0B63CE",
+    "selection": "#D6E7FF",
+    "selection_text": "#102A56",
+    "disabled_surface": "#E2E8F0",
+    "disabled_text": "#64748B",
+    "accent": "#7C3AED",
+    "warning": "#B45309",
+    "error": "#B91C1C",
+    "success": "#047857",
 }
 
-DARK_THEME = {
-    'primary': '#3498db',      # 主色
-    'secondary': '#2ecc71',    # 次要色
-    'background': '#2c3e50',   # 背景色
-    'text': '#ecf0f1',         # 文本色
-    'accent': '#9b59b6',       # 强调色
-    'warning': '#f39c12',      # 警告色
-    'error': '#e74c3c',        # 错误色
-    'success': '#2ecc71',      # 成功色
+DARK_THEME: Dict[str, str] = {
+    "primary": "#2563EB",
+    "primary_hover": "#1D4ED8",
+    "primary_pressed": "#1E40AF",
+    "primary_soft": "#172E55",
+    "secondary": "#2DD4BF",
+    "background": "#0F172A",
+    "surface": "#172033",
+    "surface_alt": "#1E293B",
+    "surface_hover": "#29364A",
+    "text": "#F8FAFC",
+    "text_muted": "#CBD5E1",
+    "text_on_primary": "#FFFFFF",
+    "border": "#475569",
+    "border_strong": "#64748B",
+    "focus": "#93C5FD",
+    "selection": "#1E4E8C",
+    "selection_text": "#FFFFFF",
+    "disabled_surface": "#263449",
+    "disabled_text": "#94A3B8",
+    "accent": "#C4B5FD",
+    "warning": "#FBBF24",
+    "error": "#FCA5A5",
+    "success": "#6EE7B7",
 }
+
 
 class StyleManager:
-    """样式管理器，负责应用程序样式和主题"""
-    
-    def __init__(self):
-        """初始化样式管理器"""
-        self.current_theme = 'light'
-        self.system_name = platform.system()
-    
-    def apply_light_theme(self, widget=None):
-        """应用浅色主题"""
-        self.current_theme = 'light'
-        stylesheet = self._generate_stylesheet(LIGHT_THEME)
-        self._apply_stylesheet(stylesheet, widget)
-        
-        if widget is None:
-            self._set_application_palette(light=True)
-    
-    def apply_dark_theme(self, widget=None):
-        """应用深色主题"""
-        self.current_theme = 'dark'
-        stylesheet = self._generate_stylesheet(DARK_THEME)
-        self._apply_stylesheet(stylesheet, widget)
-        
-        if widget is None:
-            self._set_application_palette(light=False)
-    
-    def toggle_theme(self, widget=None):
-        """切换当前主题"""
-        if self.current_theme == 'light':
-            self.apply_dark_theme(widget)
-        else:
-            self.apply_light_theme(widget)
-    
-    def _generate_stylesheet(self, colors: Dict[str, str]) -> str:
-        """
-        根据颜色方案生成样式表
-        
-        Args:
-            colors: 颜色方案词典
-            
-        Returns:
-            生成的CSS样式表
-        """
-        primary = colors['primary']
-        secondary = colors['secondary']
-        background = colors['background']
-        text = colors['text']
-        accent = colors['accent']
-        warning = colors['warning']
-        error = colors['error']
-        
-        # 判断背景色是深色还是浅色
-        is_dark_bg = self._is_dark_color(background)
-        border_color = '#555555' if is_dark_bg else '#cccccc'
-        hover_bg = self._adjust_brightness(background, -20 if is_dark_bg else 20)
-        
-        # 基本样式表
-        stylesheet = f"""
-        /* 全局样式 */
+    """Apply a consistent, accessible light, dark, or system theme."""
+
+    VALID_THEMES = frozenset({"light", "dark", "system"})
+
+    def __init__(self) -> None:
+        self.current_theme = "light"
+        self.requested_theme = "light"
+
+    def apply_theme(self, theme: str, widget: Optional[QWidget] = None) -> str:
+        """Apply *theme* and return the resolved light/dark theme name."""
+
+        normalized = str(theme).lower()
+        if normalized not in self.VALID_THEMES:
+            logging.warning("Unsupported theme %r; using system theme", theme)
+            normalized = "system"
+
+        self.requested_theme = normalized
+        resolved = self._resolve_system_theme() if normalized == "system" else normalized
+        self.current_theme = resolved
+        colors = DARK_THEME if resolved == "dark" else LIGHT_THEME
+        self._apply_stylesheet(self._generate_stylesheet(colors), widget)
+        self._apply_palette(colors, widget)
+        return resolved
+
+    def apply_light_theme(self, widget: Optional[QWidget] = None) -> None:
+        self.apply_theme("light", widget)
+
+    def apply_dark_theme(self, widget: Optional[QWidget] = None) -> None:
+        self.apply_theme("dark", widget)
+
+    def apply_system_theme(self, widget: Optional[QWidget] = None) -> str:
+        return self.apply_theme("system", widget)
+
+    def toggle_theme(self, widget: Optional[QWidget] = None) -> None:
+        self.apply_theme("light" if self.current_theme == "dark" else "dark", widget)
+
+    @staticmethod
+    def _resolve_system_theme() -> str:
+        app = QApplication.instance()
+        if app is None:
+            return "light"
+        return "dark" if app.palette().window().color().lightness() < 128 else "light"
+
+    def _generate_stylesheet(self, colors: Mapping[str, str]) -> str:
+        """Generate QSS from design tokens without overriding the system font."""
+
+        c = colors
+        return f"""
         QWidget {{
-            background-color: {background};
-            color: {text};
-            font-family: Arial, Helvetica, sans-serif;
+            background-color: {c['background']};
+            color: {c['text']};
+            selection-background-color: {c['selection']};
+            selection-color: {c['selection_text']};
         }}
-        
-        /* 按钮样式 */
-        QPushButton {{
-            background-color: {primary};
-            color: white;
-            border: none;
-            padding: 8px 16px;
+        QWidget:disabled {{ color: {c['disabled_text']}; }}
+        QMainWindow, QDialog {{ background-color: {c['background']}; }}
+        QToolTip {{
+            background-color: {c['surface']};
+            color: {c['text']};
+            border: 1px solid {c['border_strong']};
             border-radius: 4px;
-            min-width: 80px;
+            padding: 5px 7px;
         }}
-        
-        QPushButton:hover {{
-            background-color: {self._adjust_brightness(primary, -20)};
-        }}
-        
-        QPushButton:pressed {{
-            background-color: {self._adjust_brightness(primary, -40)};
-        }}
-        
-        QPushButton:disabled {{
-            background-color: {self._adjust_brightness(background, 20 if is_dark_bg else -20)};
-            color: {self._adjust_brightness(text, 40 if is_dark_bg else -40)};
-        }}
-        
-        /* 次要按钮 */
-        QPushButton[secondary="true"] {{
-            background-color: {secondary};
-            color: white;
-        }}
-        
-        QPushButton[secondary="true"]:hover {{
-            background-color: {self._adjust_brightness(secondary, -20)};
-        }}
-        
-        /* 文本框样式 */
-        QLineEdit, QTextEdit, QPlainTextEdit {{
-            background-color: {self._adjust_brightness(background, 10 if is_dark_bg else -10)};
-            color: {text};
-            border: 1px solid {border_color};
-            border-radius: 4px;
-            padding: 4px;
-        }}
-        
-        QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus {{
-            border: 2px solid {primary};
-        }}
-        
-        /* 标签样式 */
-        QLabel {{
-            color: {text};
-            background-color: transparent;
-        }}
-        
-        /* 标题标签 */
+
+        QLabel {{ background-color: transparent; }}
         QLabel[heading="true"] {{
-            font-size: 16pt;
-            font-weight: bold;
-            color: {primary};
+            color: {c['text']};
+            font-size: 18pt;
+            font-weight: 600;
         }}
-        
-        /* 下拉菜单 */
-        QComboBox {{
-            background-color: {self._adjust_brightness(background, 10 if is_dark_bg else -10)};
-            color: {text};
-            border: 1px solid {border_color};
-            border-radius: 4px;
-            padding: 4px;
-            min-width: 100px;
-        }}
-        
-        QComboBox:hover {{
-            border: 1px solid {primary};
-        }}
-        
-        QComboBox::drop-down {{
-            border: none;
-            width: 20px;
-        }}
-        
-        /* 滑块 */
-        QSlider::groove:horizontal {{
-            border: 1px solid {border_color};
-            height: 4px;
-            background: {self._adjust_brightness(background, 10 if is_dark_bg else -10)};
-            border-radius: 2px;
-        }}
-        
-        QSlider::handle:horizontal {{
-            background: {primary};
-            border: 1px solid {primary};
-            width: 16px;
-            height: 16px;
-            margin: -6px 0;
-            border-radius: 8px;
-        }}
-        
-        /* 进度条 */
-        QProgressBar {{
-            border: 1px solid {border_color};
-            border-radius: 4px;
-            background-color: {self._adjust_brightness(background, 10 if is_dark_bg else -10)};
-            text-align: center;
-        }}
-        
-        QProgressBar::chunk {{
-            background-color: {primary};
-            width: 1px;
-        }}
-        
-        /* 多选框 */
-        QCheckBox {{
-            spacing: 5px;
-        }}
-        
-        QCheckBox::indicator {{
-            width: 18px;
-            height: 18px;
-        }}
-        
-        QCheckBox::indicator:unchecked {{
-            border: 1px solid {border_color};
-            background-color: {self._adjust_brightness(background, 10 if is_dark_bg else -10)};
-        }}
-        
-        QCheckBox::indicator:checked {{
-            border: 1px solid {primary};
-            background-color: {primary};
-            image: url(:/icons/check_white.png);
-        }}
-        
-        /* 单选按钮 */
-        QRadioButton {{
-            spacing: 5px;
-        }}
-        
-        QRadioButton::indicator {{
-            width: 18px;
-            height: 18px;
-            border-radius: 9px;
-        }}
-        
-        QRadioButton::indicator:unchecked {{
-            border: 1px solid {border_color};
-            background-color: {self._adjust_brightness(background, 10 if is_dark_bg else -10)};
-        }}
-        
-        QRadioButton::indicator:checked {{
-            border: 1px solid {primary};
-            background-color: {primary};
-        }}
-        
-        /* 菜单样式 */
-        QMenuBar {{
-            background-color: {background};
-            color: {text};
-        }}
-        
-        QMenuBar::item:selected {{
-            background-color: {primary};
-            color: white;
-        }}
-        
-        QMenu {{
-            background-color: {background};
-            color: {text};
-            border: 1px solid {border_color};
-        }}
-        
-        QMenu::item:selected {{
-            background-color: {primary};
-            color: white;
-        }}
-        
-        /* 工具栏样式 */
-        QToolBar {{
-            background-color: {background};
-            border-bottom: 1px solid {border_color};
-            spacing: 6px;
-        }}
-        
-        /* 状态栏样式 */
-        QStatusBar {{
-            background-color: {self._adjust_brightness(background, -10 if is_dark_bg else 10)};
-            color: {text};
-        }}
-        
-        /* 选项卡样式 */
-        QTabWidget::pane {{
-            border: 1px solid {border_color};
-            border-top: 0px;
-        }}
-        
-        QTabBar::tab {{
-            background-color: {self._adjust_brightness(background, -10 if is_dark_bg else 10)};
-            color: {text};
-            border: 1px solid {border_color};
-            padding: 6px 12px;
-        }}
-        
-        QTabBar::tab:selected {{
-            background-color: {primary};
-            color: white;
-            border-bottom: 0px;
-        }}
-        
-        /* 滚动条样式 */
-        QScrollBar:vertical {{
-            border: none;
-            background-color: {self._adjust_brightness(background, 10 if is_dark_bg else -10)};
-            width: 12px;
+        QLabel[muted="true"] {{ color: {c['text_muted']}; }}
+
+        QPushButton {{
+            background-color: {c['surface']};
+            color: {c['text']};
+            border: 1px solid {c['border']};
             border-radius: 6px;
-            margin: 12px 0;
+            padding: 7px 14px;
+            min-height: 20px;
+            min-width: 68px;
         }}
-        
-        QScrollBar::handle:vertical {{
-            background-color: {self._adjust_brightness(primary, 20)};
-            border-radius: 6px;
+        QPushButton:hover {{
+            background-color: {c['surface_hover']};
+            border-color: {c['border_strong']};
+        }}
+        QPushButton:pressed {{ background-color: {c['surface_alt']}; }}
+        QPushButton:focus {{
+            border: 2px solid {c['focus']};
+            padding: 6px 13px;
+        }}
+        QPushButton:disabled {{
+            background-color: {c['disabled_surface']};
+            color: {c['disabled_text']};
+            border-color: {c['border']};
+        }}
+        QPushButton[primary="true"] {{
+            background-color: {c['primary']};
+            color: {c['text_on_primary']};
+            border-color: {c['primary']};
+            font-weight: 600;
+        }}
+        QPushButton[primary="true"]:hover {{
+            background-color: {c['primary_hover']};
+            border-color: {c['primary_hover']};
+        }}
+        QPushButton[primary="true"]:pressed {{
+            background-color: {c['primary_pressed']};
+            border-color: {c['primary_pressed']};
+        }}
+        QPushButton[primary="true"]:focus {{ border-color: {c['focus']}; }}
+        QPushButton[primary="true"]:disabled {{
+            background-color: {c['disabled_surface']};
+            color: {c['disabled_text']};
+            border-color: {c['border']};
+        }}
+        QPushButton[secondary="true"] {{
+            background-color: transparent;
+            color: {c['focus']};
+            border-color: {c['focus']};
+        }}
+
+        QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox,
+        QDateEdit, QTimeEdit, QDateTimeEdit, QComboBox {{
+            background-color: {c['surface']};
+            color: {c['text']};
+            border: 1px solid {c['border']};
+            border-radius: 5px;
+            padding: 6px 8px;
             min-height: 20px;
         }}
-        
-        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
-            border: none;
-            background: none;
+        QLineEdit:hover, QTextEdit:hover, QPlainTextEdit:hover,
+        QSpinBox:hover, QDoubleSpinBox:hover, QComboBox:hover {{
+            border-color: {c['border_strong']};
         }}
-        
-        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
-            background: none;
+        QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus,
+        QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{
+            border: 2px solid {c['focus']};
+            padding: 5px 7px;
         }}
-        
-        /* 水平滚动条 */
+        QLineEdit:disabled, QTextEdit:disabled, QPlainTextEdit:disabled,
+        QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled {{
+            background-color: {c['disabled_surface']};
+            color: {c['disabled_text']};
+        }}
+        QComboBox::drop-down {{ border: 0; width: 24px; }}
+        QComboBox QAbstractItemView {{
+            background-color: {c['surface']};
+            color: {c['text']};
+            border: 1px solid {c['border_strong']};
+            selection-background-color: {c['selection']};
+            selection-color: {c['selection_text']};
+            outline: 0;
+        }}
+
+        QListView, QListWidget, QTreeView, QTreeWidget, QTableView, QTableWidget {{
+            background-color: {c['surface']};
+            alternate-background-color: {c['surface_alt']};
+            color: {c['text']};
+            border: 1px solid {c['border']};
+            border-radius: 5px;
+            outline: 0;
+        }}
+        QListView::item, QListWidget::item, QTreeView::item, QTreeWidget::item {{
+            padding: 5px;
+        }}
+        QListView::item:hover, QListWidget::item:hover,
+        QTreeView::item:hover, QTreeWidget::item:hover {{
+            background-color: {c['surface_hover']};
+        }}
+        QListView::item:selected, QListWidget::item:selected,
+        QTreeView::item:selected, QTreeWidget::item:selected,
+        QTableView::item:selected, QTableWidget::item:selected {{
+            background-color: {c['selection']};
+            color: {c['selection_text']};
+        }}
+        QListView:focus, QListWidget:focus, QTreeView:focus, QTreeWidget:focus,
+        QTableView:focus, QTableWidget:focus {{ border: 2px solid {c['focus']}; }}
+        QHeaderView::section {{
+            background-color: {c['surface_alt']};
+            color: {c['text']};
+            border: 0;
+            border-right: 1px solid {c['border']};
+            border-bottom: 1px solid {c['border']};
+            padding: 6px;
+            font-weight: 600;
+        }}
+
+        QGroupBox {{
+            border: 1px solid {c['border']};
+            border-radius: 7px;
+            margin-top: 12px;
+            padding-top: 10px;
+            font-weight: 600;
+        }}
+        QGroupBox::title {{
+            subcontrol-origin: margin;
+            left: 9px;
+            padding: 0 4px;
+            background-color: {c['background']};
+        }}
+        QCheckBox, QRadioButton {{ spacing: 7px; background-color: transparent; }}
+        QCheckBox:focus, QRadioButton:focus {{ color: {c['focus']}; }}
+
+        QProgressBar {{
+            background-color: {c['surface_alt']};
+            color: {c['text']};
+            border: 1px solid {c['border']};
+            border-radius: 5px;
+            min-height: 12px;
+            text-align: center;
+        }}
+        QProgressBar::chunk {{
+            background-color: {c['primary']};
+            border-radius: 4px;
+        }}
+        QSlider::groove:horizontal {{
+            background-color: {c['surface_alt']};
+            height: 5px;
+            border-radius: 2px;
+        }}
+        QSlider::handle:horizontal {{
+            background-color: {c['primary']};
+            border: 2px solid {c['surface']};
+            width: 16px;
+            height: 16px;
+            margin: -7px 0;
+            border-radius: 9px;
+        }}
+        QSlider::handle:horizontal:focus {{ border-color: {c['focus']}; }}
+
+        QMenuBar {{
+            background-color: {c['surface']};
+            color: {c['text']};
+            border-bottom: 1px solid {c['border']};
+        }}
+        QMenuBar::item {{ padding: 5px 8px; background: transparent; }}
+        QMenuBar::item:selected, QMenuBar::item:pressed {{
+            background-color: {c['surface_hover']};
+        }}
+        QMenu {{
+            background-color: {c['surface']};
+            color: {c['text']};
+            border: 1px solid {c['border_strong']};
+            padding: 4px;
+        }}
+        QMenu::item {{ padding: 6px 28px 6px 10px; border-radius: 4px; }}
+        QMenu::item:selected {{
+            background-color: {c['selection']};
+            color: {c['selection_text']};
+        }}
+        QMenu::item:disabled {{ color: {c['disabled_text']}; }}
+        QToolBar {{
+            background-color: {c['surface']};
+            border: 0;
+            border-bottom: 1px solid {c['border']};
+            spacing: 4px;
+            padding: 4px;
+        }}
+        QToolButton {{
+            background-color: transparent;
+            border: 1px solid transparent;
+            border-radius: 5px;
+            padding: 5px;
+        }}
+        QToolButton:hover {{ background-color: {c['surface_hover']}; }}
+        QToolButton:focus {{ border-color: {c['focus']}; }}
+        QStatusBar {{
+            background-color: {c['surface']};
+            color: {c['text_muted']};
+            border-top: 1px solid {c['border']};
+        }}
+
+        QTabWidget::pane {{
+            background-color: {c['surface']};
+            border: 1px solid {c['border']};
+            border-radius: 6px;
+        }}
+        QTabBar::tab {{
+            background-color: transparent;
+            color: {c['text_muted']};
+            border: 0;
+            border-bottom: 2px solid transparent;
+            padding: 8px 12px;
+        }}
+        QTabBar::tab:hover {{ color: {c['text']}; }}
+        QTabBar::tab:selected {{
+            color: {c['focus']};
+            border-bottom-color: {c['focus']};
+            font-weight: 600;
+        }}
+        QTabBar::tab:focus {{ border-bottom-color: {c['focus']}; }}
+
+        QScrollBar:vertical {{
+            background: transparent;
+            width: 11px;
+            margin: 1px;
+        }}
         QScrollBar:horizontal {{
-            border: none;
-            background-color: {self._adjust_brightness(background, 10 if is_dark_bg else -10)};
-            height: 12px;
-            border-radius: 6px;
-            margin: 0 12px;
+            background: transparent;
+            height: 11px;
+            margin: 1px;
         }}
-        
-        QScrollBar::handle:horizontal {{
-            background-color: {self._adjust_brightness(primary, 20)};
-            border-radius: 6px;
-            min-width: 20px;
+        QScrollBar::handle:vertical, QScrollBar::handle:horizontal {{
+            background-color: {c['border_strong']};
+            border-radius: 4px;
+            min-height: 24px;
+            min-width: 24px;
         }}
-        
-        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
-            border: none;
-            background: none;
+        QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {{
+            background-color: {c['text_muted']};
         }}
-        
-        QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
-            background: none;
+        QScrollBar::add-line, QScrollBar::sub-line,
+        QScrollBar::add-page, QScrollBar::sub-page {{
+            background: transparent;
+            border: 0;
         }}
-        
-        /* 自定义视频导入页面 */
-        #videoImportWidget {{
-            background-color: {background};
-        }}
-        
-        #dropZone {{
-            border: 2px dashed {border_color};
+
+        #videoImportWidget {{ background-color: {c['background']}; }}
+        #videoInfoFrame {{
+            background-color: {c['surface']};
+            border: 1px solid {c['border']};
             border-radius: 8px;
-            background-color: {self._adjust_brightness(background, 5 if is_dark_bg else -5)};
+        }}
+        #thumbnailPreview {{
+            background-color: #111827;
+            color: #F8FAFC;
+            border: 1px solid {c['border']};
+            border-radius: 6px;
+        }}
+        #dropZone {{
+            background-color: {c['surface']};
+            color: {c['text_muted']};
+            border: 2px dashed {c['border_strong']};
+            border-radius: 10px;
             padding: 20px;
         }}
-        
         #dropZone:hover {{
-            border-color: {primary};
+            background-color: {c['primary_soft']};
+            color: {c['text']};
+            border-color: {c['primary']};
         }}
-        
-        /* 自定义处理页面 */
-        .ProcessingWidget {{
-            background-color: {background};
+        #dropZone:focus {{
+            background-color: {c['primary_soft']};
+            color: {c['text']};
+            border: 3px solid {c['focus']};
+            padding: 19px;
         }}
-        
-        .ProcessingWidget QLabel[stage="complete"] {{
-            color: {colors['success']};
+        #dropZone[dragActive="true"] {{
+            background-color: {c['primary_soft']};
+            color: {c['text']};
+            border: 3px solid {c['primary']};
+            padding: 19px;
         }}
-        
-        .ProcessingWidget QLabel[stage="error"] {{
-            color: {colors['error']};
-        }}
-        
-        .ProcessingWidget QLabel[stage="waiting"] {{
-            color: {self._adjust_brightness(text, 60 if is_dark_bg else -60)};
-        }}
-        
-        /* 自定义字幕编辑器 */
+        .ProcessingWidget QLabel[stage="complete"] {{ color: {c['success']}; }}
+        .ProcessingWidget QLabel[stage="error"] {{ color: {c['error']}; }}
+        .ProcessingWidget QLabel[stage="waiting"] {{ color: {c['text_muted']}; }}
         #timelineWidget {{
-            background-color: {self._adjust_brightness(background, -10 if is_dark_bg else 10)};
-            border: 1px solid {border_color};
+            background-color: {c['surface_alt']};
+            border: 1px solid {c['border']};
         }}
-        
-        #bilingualEditor {{
-            background-color: {self._adjust_brightness(background, 5 if is_dark_bg else -5)};
-        }}
+        #bilingualEditor {{ background-color: {c['surface']}; }}
         """
-        
-        # 根据操作系统添加特定样式
-        if self.system_name == 'Darwin':  # macOS
-            stylesheet += """
-            /* macOS 特定样式 */
-            QToolBar {
-                border: none;
-            }
-            """
-        elif self.system_name == 'Windows':
-            stylesheet += """
-            /* Windows 特定样式 */
-            QWidget {
-                font-family: 'Segoe UI', Arial, sans-serif;
-            }
-            """
-        
-        return stylesheet
-    
-    def _apply_stylesheet(self, stylesheet: str, widget: Optional[QWidget] = None):
-        """
-        应用样式表到小部件或应用程序
-        
-        Args:
-            stylesheet: CSS样式表
-            widget: 目标小部件，如为None则应用到整个应用程序
-        """
-        try:
-            if widget is None:
-                QApplication.instance().setStyleSheet(stylesheet)
-            else:
-                widget.setStyleSheet(stylesheet)
-                
-            logging.debug(f"已应用 {self.current_theme} 主题样式表")
-        except Exception as e:
-            logging.error(f"应用样式表失败: {str(e)}")
-    
-    def _set_application_palette(self, light: bool = True):
-        """
-        设置应用程序调色板
-        
-        Args:
-            light: 是否使用浅色调色板
-        """
-        try:
-            app = QApplication.instance()
-            if not app:
-                return
-                
-            palette = QPalette()
-            
-            if light:
-                # 浅色主题调色板
-                palette.setColor(QPalette.ColorRole.Window, QColor("#f5f5f5"))
-                palette.setColor(QPalette.ColorRole.WindowText, QColor("#333333"))
-                palette.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
-                palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#e9e9e9"))
-                palette.setColor(QPalette.ColorRole.Text, QColor("#333333"))
-                palette.setColor(QPalette.ColorRole.Button, QColor("#f5f5f5"))
-                palette.setColor(QPalette.ColorRole.ButtonText, QColor("#333333"))
-                palette.setColor(QPalette.ColorRole.BrightText, QColor("#ffffff"))
-                palette.setColor(QPalette.ColorRole.Highlight, QColor("#3498db"))
-                palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
-            else:
-                # 深色主题调色板
-                palette.setColor(QPalette.ColorRole.Window, QColor("#2c3e50"))
-                palette.setColor(QPalette.ColorRole.WindowText, QColor("#ecf0f1"))
-                palette.setColor(QPalette.ColorRole.Base, QColor("#34495e"))
-                palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#3d566e"))
-                palette.setColor(QPalette.ColorRole.Text, QColor("#ecf0f1"))
-                palette.setColor(QPalette.ColorRole.Button, QColor("#2c3e50"))
-                palette.setColor(QPalette.ColorRole.ButtonText, QColor("#ecf0f1"))
-                palette.setColor(QPalette.ColorRole.BrightText, QColor("#ffffff"))
-                palette.setColor(QPalette.ColorRole.Highlight, QColor("#3498db"))
-                palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
-                
-            app.setPalette(palette)
-        except Exception as e:
-            logging.error(f"设置应用程序调色板失败: {str(e)}")
-    
+
+    @staticmethod
+    def _apply_stylesheet(stylesheet: str, widget: Optional[QWidget] = None) -> None:
+        target = widget or QApplication.instance()
+        if target is None:
+            logging.warning("Cannot apply stylesheet before QApplication is created")
+            return
+        target.setStyleSheet(stylesheet)
+
+    @classmethod
+    def _apply_palette(
+        cls,
+        colors: Mapping[str, str],
+        widget: Optional[QWidget] = None,
+    ) -> None:
+        palette = cls._build_palette(colors)
+        target = widget or QApplication.instance()
+        if target is not None:
+            target.setPalette(palette)
+
+    @staticmethod
+    def _build_palette(colors: Mapping[str, str]) -> QPalette:
+        palette = QPalette()
+        roles = {
+            QPalette.Window: colors["background"],
+            QPalette.WindowText: colors["text"],
+            QPalette.Base: colors["surface"],
+            QPalette.AlternateBase: colors["surface_alt"],
+            QPalette.ToolTipBase: colors["surface"],
+            QPalette.ToolTipText: colors["text"],
+            QPalette.Text: colors["text"],
+            QPalette.Button: colors["surface"],
+            QPalette.ButtonText: colors["text"],
+            QPalette.BrightText: colors["text_on_primary"],
+            QPalette.Highlight: colors["primary"],
+            QPalette.HighlightedText: colors["text_on_primary"],
+            QPalette.Link: colors["focus"],
+        }
+        for role, value in roles.items():
+            palette.setColor(role, QColor(value))
+        for role in (QPalette.WindowText, QPalette.Text, QPalette.ButtonText):
+            palette.setColor(QPalette.Disabled, role, QColor(colors["disabled_text"]))
+        palette.setColor(QPalette.Disabled, QPalette.Button, QColor(colors["disabled_surface"]))
+        palette.setColor(QPalette.Disabled, QPalette.Base, QColor(colors["disabled_surface"]))
+        return palette
+
+    def _set_application_palette(self, light: bool = True) -> None:
+        """Compatibility wrapper retained for existing callers."""
+
+        self._apply_palette(LIGHT_THEME if light else DARK_THEME)
+
     @staticmethod
     def _is_dark_color(hex_color: str) -> bool:
-        """
-        判断颜色是否为深色
-        
-        Args:
-            hex_color: 十六进制颜色代码
-            
-        Returns:
-            如果是深色则返回True，否则返回False
-        """
-        # 移除井号（如果存在）
-        hex_color = hex_color.lstrip('#')
-        
-        # 转换为RGB
-        r = int(hex_color[0:2], 16)
-        g = int(hex_color[2:4], 16)
-        b = int(hex_color[4:6], 16)
-        
-        # 计算亮度
-        brightness = (r * 299 + g * 587 + b * 114) / 1000
-        
-        # 亮度低于128认为是深色
-        return brightness < 128
-    
+        color = QColor(hex_color)
+        if not color.isValid():
+            raise ValueError(f"Invalid color: {hex_color!r}")
+        return color.lightness() < 128
+
     @staticmethod
     def _adjust_brightness(hex_color: str, amount: int) -> str:
-        """
-        调整颜色亮度
-        
-        Args:
-            hex_color: 十六进制颜色代码
-            amount: 亮度调整量（正值增加亮度，负值减少亮度）
-            
-        Returns:
-            调整后的十六进制颜色
-        """
-        # 移除井号（如果存在）
-        hex_color = hex_color.lstrip('#')
-        
-        # 转换为RGB
-        r = int(hex_color[0:2], 16)
-        g = int(hex_color[2:4], 16)
-        b = int(hex_color[4:6], 16)
-        
-        # 调整亮度
-        r = max(0, min(255, r + amount))
-        g = max(0, min(255, g + amount))
-        b = max(0, min(255, b + amount))
-        
-        # 转换回十六进制
-        return f"#{r:02x}{g:02x}{b:02x}"
-    
-    def load_font(self, font_name: str, font_path: str) -> bool:
-        """
-        加载自定义字体
-        
-        Args:
-            font_name: 字体名称
-            font_path: 字体文件路径
-            
-        Returns:
-            成功则返回True，失败则返回False
-        """
+        color = QColor(hex_color)
+        if not color.isValid():
+            raise ValueError(f"Invalid color: {hex_color!r}")
+        return "#{:02x}{:02x}{:02x}".format(
+            max(0, min(255, color.red() + amount)),
+            max(0, min(255, color.green() + amount)),
+            max(0, min(255, color.blue() + amount)),
+        )
+
+    @staticmethod
+    def load_font(font_name: str, font_path: str) -> bool:
+        """Load an optional application font without making it a dependency."""
+
         from PyQt5.QtGui import QFontDatabase
+
         try:
             font_id = QFontDatabase.addApplicationFont(font_path)
-            if font_id == -1:
-                logging.error(f"加载字体失败: {font_path}")
-                return False
-                
-            logging.debug(f"已加载字体: {font_name}")
-            return True
-        except Exception as e:
-            logging.error(f"加载字体时发生错误: {str(e)}")
+        except Exception:
+            logging.exception("Failed to load font %s from %s", font_name, font_path)
             return False
-    
+        if font_id == -1:
+            logging.error("Failed to load font %s from %s", font_name, font_path)
+            return False
+        return True
+
     def get_theme_colors(self) -> Dict[str, str]:
-        """
-        获取当前主题的颜色方案
-        
-        Returns:
-            颜色方案词典
-        """
-        return DARK_THEME if self.current_theme == 'dark' else LIGHT_THEME
-    
+        return (DARK_THEME if self.current_theme == "dark" else LIGHT_THEME).copy()
+
     def get_specific_color(self, color_name: str) -> str:
-        """
-        获取当前主题中特定的颜色
-        
-        Args:
-            color_name: 颜色名称 (primary, secondary, background等)
-            
-        Returns:
-            十六进制颜色代码
-        """
         colors = self.get_theme_colors()
-        return colors.get(color_name, "#000000" if self.current_theme == 'light' else "#ffffff")
-    
+        return colors.get(color_name, "#FFFFFF" if self.current_theme == "dark" else "#000000")
+
     def get_adjusted_color_scheme(self, brightness_offset: int = 0) -> Dict[str, str]:
-        """
-        获取亮度调整后的颜色方案
-        
-        Args:
-            brightness_offset: 亮度调整量
-            
-        Returns:
-            调整后的颜色方案词典
-        """
-        colors = self.get_theme_colors()
-        adjusted_colors = {}
-        
-        for name, color in colors.items():
-            adjusted_colors[name] = self._adjust_brightness(color, brightness_offset)
-            
-        return adjusted_colors
-    
+        return {
+            name: self._adjust_brightness(color, brightness_offset)
+            for name, color in self.get_theme_colors().items()
+        }
+
     def get_custom_theme(self, primary_color: str) -> Dict[str, str]:
-        """
-        基于主色创建自定义主题
-        
-        Args:
-            primary_color: 十六进制主色
-            
-        Returns:
-            自定义主题颜色方案
-        """
-        # 从当前主题复制颜色方案
-        custom_theme = self.get_theme_colors().copy()
-        
-        # 设置新的主色
-        custom_theme['primary'] = primary_color
-        
-        # 根据主色调整其他颜色
-        is_dark = self._is_dark_color(primary_color)
-        
-        # 如果主色是深色但当前是浅色主题，或主色是浅色但当前是深色主题
-        # 可能需要调整其他颜色
-        if is_dark and self.current_theme == 'light':
-            # 调整次要色为主色的较亮版本
-            custom_theme['secondary'] = self._adjust_brightness(primary_color, 40)
-        elif not is_dark and self.current_theme == 'dark':
-            # 调整次要色为主色的较暗版本
-            custom_theme['secondary'] = self._adjust_brightness(primary_color, -40)
-        
+        if not QColor(primary_color).isValid():
+            raise ValueError(f"Invalid primary color: {primary_color!r}")
+        custom_theme = self.get_theme_colors()
+        custom_theme["primary"] = QColor(primary_color).name()
+        custom_theme["primary_hover"] = self._adjust_brightness(primary_color, -18)
+        custom_theme["primary_pressed"] = self._adjust_brightness(primary_color, -34)
         return custom_theme

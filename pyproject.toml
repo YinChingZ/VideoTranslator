@@ -1,19 +1,117 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video-translator"
+version = "2.0.0"
+description = "Cross-platform desktop workflow for transcribing, translating, editing, and exporting video subtitles"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["video", "subtitles", "translation", "whisper", "pyqt"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
+]
+dependencies = [
+    "PyQt5>=5.15.11",
+    "ffmpeg-python>=0.2.0",
+    "pysrt>=1.1.2",
+    "webvtt-py>=0.5.1",
+    "chardet>=5.2.0",
+    "requests>=2.32.0",
+    "numpy>=1.26.0",
+    "soundfile>=0.12.1",
+    "psutil>=5.9.0",
+    "keyring>=25.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/YinChingZ/VideoTranslator"
+Repository = "https://github.com/YinChingZ/VideoTranslator.git"
+Issues = "https://github.com/YinChingZ/VideoTranslator/issues"
+
+[project.optional-dependencies]
+# Speech recognition is intentionally opt-in: PyTorch and Whisper dominate the
+# download size and are not needed for subtitle-only editing/export workflows.
+speech = [
+    "openai-whisper>=20230308",
+    "torch>=2.0.0",
+]
+media = [
+    "librosa>=0.10.2",
+    "pydub>=0.25.1",
+]
+playback = [
+    "python-vlc>=3.0.21203",
+]
+full = [
+    "openai-whisper>=20230308",
+    "torch>=2.0.0",
+    "librosa>=0.10.2",
+    "pydub>=0.25.1",
+    "python-vlc>=3.0.21203",
+]
+dev = [
+    "build>=1.2.2",
+    "mypy>=1.14.0",
+    "pytest>=8.3.0",
+    "pytest-cov>=6.0.0",
+    "pytest-qt>=4.4.0",
+    "ruff>=0.9.0",
+    "types-requests>=2.32.0",
+]
+
+[project.gui-scripts]
+video-translator = "main:main"
+
+[tool.setuptools]
+include-package-data = true
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+exclude = ["tests*", "docs*", "model*", "scripts*"]
+namespaces = true
+
 [tool.pytest.ini_options]
-# pytest配置文件
-testpaths = ["tests"]
-python_files = ["test_*.py", "*_test.py"]
+# Default collection is limited to unit tests. Historical integration and debug
+# scripts remain explicitly runnable, but no longer execute accidentally.
+minversion = "8.3"
+testpaths = ["tests/unit"]
+python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-addopts = "-v --tb=short"
+addopts = [
+    "--strict-config",
+    "--strict-markers",
+    "--import-mode=importlib",
+    "-ra",
+    "--tb=short",
+]
+xfail_strict = true
 markers = [
-    "unit: 单元测试",
-    "integration: 集成测试", 
-    "debug: 调试测试",
-    "slow: 慢速测试",
-    "gui: GUI测试"
+    "unit: isolated unit test",
+    "integration: test spanning multiple application components",
+    "debug: diagnostic test or developer utility",
+    "slow: test that takes materially longer than the unit suite",
+    "gui: test requiring Qt widgets or an event loop",
 ]
 
 [tool.coverage.run]
+branch = true
 source = ["app"]
 omit = [
     "tests/*",
@@ -21,10 +119,12 @@ omit = [
     "*/__pycache__/*",
     "*/migrations/*",
     "*/venv/*",
-    "*/env/*"
+    "*/env/*",
 ]
 
 [tool.coverage.report]
+show_missing = true
+skip_covered = true
 exclude_lines = [
     "pragma: no cover",
     "def __repr__",
@@ -33,5 +133,19 @@ exclude_lines = [
     "raise AssertionError",
     "raise NotImplementedError",
     "if 0:",
-    "if __name__ == .__main__.:"
+    "if __name__ == .__main__.:",
 ]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.mypy]
+python_version = "3.11"
+check_untyped_defs = true
+ignore_missing_imports = true
+warn_redundant_casts = true
+warn_unused_ignores = true

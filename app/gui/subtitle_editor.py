@@ -5,93 +5,224 @@ Subtitle Editor GUI module for video translation system.
 Provides interface for editing subtitles with video preview.
 """
 
-import os
-import sys
+import copy
+import importlib
 import logging
-from typing import List, Dict, Optional, Tuple, Any, Callable
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from typing import List
 
 from PyQt5.QtCore import (
-    Qt, QUrl, QTime, QTimer, QSize, pyqtSignal, QEvent,
-    QPropertyAnimation, QEasingCurve, QPoint, QModelIndex
+    QEvent,
+    QObject,
+    QRunnable,
+    Qt,
+    QThreadPool,
+    QTimer,
+    pyqtSignal,
+    pyqtSlot,
 )
 from PyQt5.QtGui import (
-    QFont, QColor, QPalette, QKeySequence,
-    QPainter, QPen, QTextCursor, QTextCharFormat, QPixmap, QImage
+    QColor,
+    QKeySequence,
+    QPixmap,
 )
-from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QLabel,
-    QPushButton, QScrollArea, QTextEdit, QListWidget, QListWidgetItem,
-    QSlider, QComboBox, QToolBar, QSpinBox, QDoubleSpinBox, QColorDialog,
-    QMenu, QDialog, QDialogButtonBox, QGridLayout, QGroupBox, QCheckBox,
-    QToolButton, QSizePolicy, QFrame, QShortcut, QApplication, QStackedWidget
-)
-from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
+from PyQt5.QtMultimedia import QMediaPlayer
 from PyQt5.QtMultimediaWidgets import QVideoWidget
-import cv2
-# Add VLC DLL search path on Windows before importing vlc
+from PyQt5.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QColorDialog,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QPushButton,
+    QShortcut,
+    QSizePolicy,
+    QSlider,
+    QSpinBox,
+    QSplitter,
+    QStackedWidget,
+    QTextEdit,
+    QToolBar,
+    QUndoCommand,
+    QUndoStack,
+    QVBoxLayout,
+    QWidget,
+)
+
+from app.core.subtitle import SubtitleProcessor, SubtitleSegment
+from app.gui.custom_widgets import TimelineWidget
+from app.utils.format_converter import format_time
+
+logger = logging.getLogger(__name__)
+
+# VLC is an optional playback helper. Importing it can fail with an OSError
+# when the Python module exists but its native library does not, so keep the
+# import lazy and guarded. The editor remains usable for subtitle work and
+# falls back to an asynchronous static FFmpeg frame without VLC.
+vlc = None
+vlc_available = False
+_vlc_import_checked = False
+_vlc_import_error = None
+# Retained as a compatibility/introspection marker for older integrations.
+# OpenCV is no longer a preview backend; static fallback is handled by FFmpeg.
+_cv2_import_checked = False
+
+# Add VLC DLL search path on Windows immediately before the optional import.
 libvlc_path = None
 plugins_path = None
-if sys.platform.startswith("win"):
-    # 直接指定VLC路径并添加到DLL搜索目录和环境变量PATH
+
+
+def _configure_windows_vlc_paths():
+    """配置 Windows VLC 原生库搜索路径。"""
+    global libvlc_path, plugins_path
+    if not sys.platform.startswith("win"):
+        return
+
     vlc_paths = [
         os.environ.get("VLC_DIR"),
         r"C:\Program Files\VideoLAN\VLC",
         r"C:\Program Files (x86)\VideoLAN\VLC"
     ]
-    
-    # 先导入logging
-    import logging
-    logger = logging.getLogger(__name__)
-    
-    # 找到并使用有效的VLC路径
+
     for path in vlc_paths:
         if path and os.path.isdir(path):
-            os.add_dll_directory(path)
-            # 同时添加到PATH环境变量
+            if hasattr(os, "add_dll_directory"):
+                os.add_dll_directory(path)
             if path not in os.environ.get('PATH', ''):
                 os.environ['PATH'] = path + os.pathsep + os.environ.get('PATH', '')
-            # 记录路径，用于后续初始化
             libvlc_path = path
             plugins_path = os.path.join(path, 'plugins')
             logger.info(f"已添加VLC目录: {path}")
             break
-import vlc
 
-import tempfile, uuid, shutil
+
+def _load_vlc_module():
+    """延迟加载 python-vlc；缺失模块或原生库时返回 None。"""
+    global vlc, _vlc_import_checked, _vlc_import_error
+    if _vlc_import_checked:
+        return vlc
+
+    _vlc_import_checked = True
+    _configure_windows_vlc_paths()
+    try:
+        vlc = importlib.import_module("vlc")
+    except (ImportError, OSError) as exc:
+        _vlc_import_error = exc
+        vlc = None
+        logger.info("VLC 播放后端不可用，将使用静态画面预览: %s", exc)
+    return vlc
+
 
 # 检查 VLC 是否可用的函数
 def is_vlc_available():
     """检查 VLC 库是否可用"""
+    global vlc_available
+    vlc_module = _load_vlc_module()
+    if vlc_module is None:
+        vlc_available = False
+        return False
+
+    test_instance = None
+    test_player = None
     try:
         # 尝试创建一个简单的 VLC 实例
-        test_instance = vlc.Instance(['--quiet'])
+        test_instance = vlc_module.Instance(['--quiet'])
         if test_instance is None:
+            vlc_available = False
             return False
         # 检查是否可以创建媒体播放器
         test_player = test_instance.media_player_new()
         if test_player is None:
+            vlc_available = False
             return False
+        vlc_available = True
         return True
     except Exception as e:
-        logger.error(f"VLC 不可用: {str(e)}")
+        vlc_available = False
+        logger.info(f"VLC 不可用，将使用静态画面预览: {str(e)}")
         return False
+    finally:
+        try:
+            if test_player is not None and hasattr(test_player, "release"):
+                test_player.release()
+            if test_instance is not None and hasattr(test_instance, "release"):
+                test_instance.release()
+        except Exception:
+            logger.debug("释放 VLC 可用性检查资源时出错", exc_info=True)
 
-# 在启动时检查 VLC 可用性
-vlc_available = is_vlc_available()
 
-# Import custom modules
-from app.core.subtitle import SubtitleProcessor, SubtitleSegment
-from app.gui.custom_widgets import TimelineWidget, WaveformView
-from app.utils.format_converter import format_time, parse_time
+class _FrameExtractionSignals(QObject):
+    """Thread-safe result channel for one static-preview request."""
 
-# 定义临时图片路径
-temp_img = os.path.join(tempfile.gettempdir(), f"frame_{uuid.uuid4().hex}.jpg")
+    succeeded = pyqtSignal(int, str, bytes)
+    failed = pyqtSignal(int, str, str)
 
-logger = logging.getLogger(__name__)
+
+class _FrameExtractionTask(QRunnable):
+    """Extract one preview frame without blocking the Qt GUI thread."""
+
+    def __init__(self, request_id: int, video_path: str, ffmpeg_path: str = "ffmpeg"):
+        super().__init__()
+        self.request_id = request_id
+        self.video_path = video_path
+        self.ffmpeg_path = ffmpeg_path
+        self.signals = _FrameExtractionSignals()
+
+    @pyqtSlot()
+    def run(self):
+        file_descriptor, frame_path = tempfile.mkstemp(
+            prefix="video-translator-frame-", suffix=".jpg"
+        )
+        os.close(file_descriptor)
+        try:
+            subprocess.run(
+                [
+                    self.ffmpeg_path,
+                    "-y",
+                    "-ss",
+                    "00:00:00",
+                    "-i",
+                    self.video_path,
+                    "-frames:v",
+                    "1",
+                    frame_path,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+                timeout=30,
+            )
+            with open(frame_path, "rb") as frame_file:
+                frame_data = frame_file.read()
+            if not frame_data:
+                raise ValueError("首帧图像为空")
+            self.signals.succeeded.emit(
+                self.request_id, self.video_path, frame_data
+            )
+        except Exception as exc:
+            self.signals.failed.emit(
+                self.request_id, self.video_path, str(exc)
+            )
+        finally:
+            try:
+                os.unlink(frame_path)
+            except FileNotFoundError:
+                pass
 
 
 class SubtitleListItem(QListWidgetItem):
-    """Custom list widget item to represent subtitle segments"""
+    """表示单个字幕片段的列表项。"""
     
     def __init__(self, segment: SubtitleSegment, index: int):
         super().__init__()
@@ -100,7 +231,7 @@ class SubtitleListItem(QListWidgetItem):
         self.update_display()
         
     def update_display(self):
-        """Update the displayed text based on segment data"""
+        """根据字幕数据更新显示文本。"""
         start_time = format_time(self.segment.start_time)
         end_time = format_time(self.segment.end_time)
         
@@ -113,13 +244,155 @@ class SubtitleListItem(QListWidgetItem):
         self.setText(display_text)
 
 
+class _SubtitleStateCommand(QUndoCommand):
+    """Restore an editor-wide subtitle state for undo and redo.
+
+    Mutating slots update the live state before pushing a command.  Skipping
+    the first ``redo`` is important for text edits: rebuilding the editor on
+    every keystroke would reset the cursor and break normal typing.
+    """
+
+    _MERGE_ID = 0x5654
+
+    def __init__(
+        self,
+        editor,
+        text: str,
+        before_segments,
+        after_segments,
+        before_selection,
+        after_selection,
+        merge_key=None,
+    ):
+        super().__init__(text)
+        self._editor = editor
+        self._before_segments = before_segments
+        self._after_segments = after_segments
+        self._before_selection = before_selection
+        self._after_selection = after_selection
+        self._merge_key = merge_key
+        self._first_redo = True
+
+    def id(self):
+        """Allow adjacent changes in one typing/timing session to coalesce."""
+        return self._MERGE_ID if self._merge_key is not None else -1
+
+    def mergeWith(self, other):
+        if not isinstance(other, _SubtitleStateCommand):
+            return False
+        if self._editor is not other._editor or self._merge_key != other._merge_key:
+            return False
+        self._after_segments = other._after_segments
+        self._after_selection = other._after_selection
+        return True
+
+    def undo(self):
+        self._editor._restore_history_state(
+            self._before_segments, self._before_selection
+        )
+
+    def redo(self):
+        if self._first_redo:
+            self._first_redo = False
+            self._editor._finish_live_history_change()
+            return
+        self._editor._restore_history_state(
+            self._after_segments, self._after_selection
+        )
+
+
+class SubtitleValidationDialog(QDialog):
+    """Display validation findings and let users jump to a segment."""
+
+    issueActivated = pyqtSignal(int)
+
+    _MESSAGES = {
+        "no_segments": "没有可检查的字幕片段",
+        "non_finite_timing": "开始或结束时间不是有效数字",
+        "negative_start": "开始时间不能为负数",
+        "invalid_range": "结束时间必须晚于开始时间",
+        "overlap": "与前一个字幕片段重叠",
+        "very_short": "显示时间短于 0.5 秒",
+        "very_long": "显示时间长于 7 秒",
+        "empty_text": "原文和译文均为空",
+    }
+
+    def __init__(self, issues: List[dict], parent=None):
+        super().__init__(parent)
+        self.issues = issues
+        self.setWindowTitle("字幕检查结果")
+        self.setMinimumSize(560, 340)
+        self.setAccessibleName("字幕检查结果")
+
+        layout = QVBoxLayout(self)
+        error_count = sum(issue.get("type") == "error" for issue in issues)
+        warning_count = sum(issue.get("type") == "warning" for issue in issues)
+        self.summary_label = QLabel(
+            f"共发现 {len(issues)} 个问题：{error_count} 个错误，"
+            f"{warning_count} 个警告"
+        )
+        self.summary_label.setProperty("heading", True)
+        self.summary_label.setAccessibleName("字幕问题汇总")
+        layout.addWidget(self.summary_label)
+
+        hint = QLabel("选择问题并点击“转到字幕”，或双击列表项。")
+        hint.setProperty("muted", True)
+        layout.addWidget(hint)
+
+        self.issue_list = QListWidget()
+        self.issue_list.setAccessibleName("字幕问题列表")
+        self.issue_list.setAlternatingRowColors(True)
+        for issue in issues:
+            severity = "错误" if issue.get("type") == "error" else "警告"
+            segment_idx = issue.get("segment_idx")
+            location = f"第 {segment_idx + 1} 段" if segment_idx is not None else "全局"
+            message = self._MESSAGES.get(
+                issue.get("code"), issue.get("message", "未知问题")
+            )
+            item = QListWidgetItem(f"[{severity}] {location} · {message}")
+            item.setData(Qt.UserRole, segment_idx)
+            item.setToolTip(issue.get("message", message))
+            self.issue_list.addItem(item)
+        layout.addWidget(self.issue_list, 1)
+
+        self.button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        self.jump_button = self.button_box.addButton(
+            "转到字幕", QDialogButtonBox.ButtonRole.ActionRole
+        )
+        self.jump_button.setAccessibleName("转到有问题的字幕片段")
+        self.jump_button.clicked.connect(self._activate_current)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+
+        self.issue_list.currentItemChanged.connect(self._update_jump_button)
+        self.issue_list.itemDoubleClicked.connect(lambda _item: self._activate_current())
+        if self.issue_list.count():
+            self.issue_list.setCurrentRow(0)
+        self._update_jump_button(self.issue_list.currentItem())
+
+    def _update_jump_button(self, item, _previous=None):
+        self.jump_button.setEnabled(
+            item is not None and item.data(Qt.UserRole) is not None
+        )
+
+    def _activate_current(self):
+        item = self.issue_list.currentItem()
+        if item is None:
+            return
+        segment_idx = item.data(Qt.UserRole)
+        if segment_idx is None:
+            return
+        self.issueActivated.emit(int(segment_idx))
+        self.accept()
+
+
 class SegmentEditDialog(QDialog):
-    """Dialog for detailed editing of a subtitle segment"""
+    """用于精细编辑单个字幕片段的对话框。"""
     
     def __init__(self, segment: SubtitleSegment, parent=None):
         super().__init__(parent)
         self.segment = segment
-        self.setWindowTitle("Edit Subtitle Segment")
+        self.setWindowTitle("编辑字幕片段")
         self.setup_ui()
         
     def setup_ui(self):
@@ -127,11 +400,11 @@ class SegmentEditDialog(QDialog):
         layout = QGridLayout(self)
         
         # Time controls
-        time_group = QGroupBox("Timing")
+        time_group = QGroupBox("时间")
         time_layout = QGridLayout()
         
         # Start time
-        time_layout.addWidget(QLabel("Start Time:"), 0, 0)
+        time_layout.addWidget(QLabel("开始时间："), 0, 0)
         self.start_time = QDoubleSpinBox()
         self.start_time.setDecimals(3)
         self.start_time.setRange(0, 86400)  # 24 hours max
@@ -140,7 +413,7 @@ class SegmentEditDialog(QDialog):
         time_layout.addWidget(self.start_time, 0, 1)
         
         # End time
-        time_layout.addWidget(QLabel("End Time:"), 1, 0)
+        time_layout.addWidget(QLabel("结束时间："), 1, 0)
         self.end_time = QDoubleSpinBox()
         self.end_time.setDecimals(3)
         self.end_time.setRange(0, 86400)  # 24 hours max
@@ -149,8 +422,8 @@ class SegmentEditDialog(QDialog):
         time_layout.addWidget(self.end_time, 1, 1)
         
         # Duration (calculated)
-        time_layout.addWidget(QLabel("Duration:"), 2, 0)
-        self.duration = QLabel(f"{self.segment.end_time - self.segment.start_time:.3f} seconds")
+        time_layout.addWidget(QLabel("持续时间："), 2, 0)
+        self.duration = QLabel(f"{self.segment.end_time - self.segment.start_time:.3f} 秒")
         time_layout.addWidget(self.duration, 2, 1)
         
         # Connect signals to update duration
@@ -161,17 +434,17 @@ class SegmentEditDialog(QDialog):
         layout.addWidget(time_group, 0, 0, 1, 2)
         
         # Text editing
-        text_group = QGroupBox("Text")
+        text_group = QGroupBox("文本")
         text_layout = QVBoxLayout()
         
         # Original text
-        text_layout.addWidget(QLabel("Original Text:"))
+        text_layout.addWidget(QLabel("原文："))
         self.original_text = QTextEdit()
         self.original_text.setPlainText(self.segment.original_text)
         text_layout.addWidget(self.original_text)
         
         # Translated text
-        text_layout.addWidget(QLabel("Translated Text:"))
+        text_layout.addWidget(QLabel("译文："))
         self.translated_text = QTextEdit()
         self.translated_text.setPlainText(self.segment.translated_text)
         text_layout.addWidget(self.translated_text)
@@ -180,11 +453,11 @@ class SegmentEditDialog(QDialog):
         layout.addWidget(text_group, 1, 0, 1, 2)
         
         # Style options
-        style_group = QGroupBox("Style (Advanced)")
+        style_group = QGroupBox("样式（高级）")
         style_layout = QGridLayout()
         
         # Font size
-        style_layout.addWidget(QLabel("Font Size:"), 0, 0)
+        style_layout.addWidget(QLabel("字号："), 0, 0)
         self.font_size = QSpinBox()
         self.font_size.setRange(8, 72)
         
@@ -197,7 +470,7 @@ class SegmentEditDialog(QDialog):
         style_layout.addWidget(self.font_size, 0, 1)
         
         # Text color
-        style_layout.addWidget(QLabel("Text Color:"), 1, 0)
+        style_layout.addWidget(QLabel("文字颜色："), 1, 0)
         self.color_button = QPushButton()
         self.current_color = QColor("white")  # Default
         
@@ -248,7 +521,7 @@ class SegmentEditDialog(QDialog):
     
     def select_color(self):
         """Open color picker dialog"""
-        color = QColorDialog.getColor(self.current_color, self, "Select Text Color")
+        color = QColorDialog.getColor(self.current_color, self, "选择文字颜色")
         if color.isValid():
             self.current_color = color
             self.update_color_button()
@@ -264,7 +537,7 @@ class SegmentEditDialog(QDialog):
             end = start
             
         duration = end - start
-        self.duration.setText(f"{duration:.3f} seconds")
+        self.duration.setText(f"{duration:.3f} 秒")
     
     def accept(self):
         """Apply changes to the segment when OK is clicked"""
@@ -298,6 +571,7 @@ class SubtitleEditor(QWidget):
     segmentsChanged = pyqtSignal()  # Emitted when subtitle data changes
     videoPositionChanged = pyqtSignal(float)  # Current video position in seconds
     playStateChanged = pyqtSignal(bool)  # True when playing, False when paused
+    importSubtitleRequested = pyqtSignal()
     
     def __init__(self, video_path: str, subtitle_processor: SubtitleProcessor, parent=None):
         """
@@ -315,6 +589,22 @@ class SubtitleEditor(QWidget):
         self.current_segment_index = -1  # No segment selected initially
         self.current_position = 0.0  # Current video position in seconds
         self.is_playing = False
+        self.undo_stack = QUndoStack(self)
+        self._history_restoring = False
+        self._edit_session = 0
+        self._last_history_state = self._snapshot_segments()
+        self._fallback_generation = 0
+        self._fallback_tasks = {}
+        self._fallback_source_pixmap = QPixmap()
+        self._fallback_thread_pool = QThreadPool.globalInstance()
+        self._is_closing = False
+        self._playback_prepare_timer = QTimer(self)
+        self._playback_prepare_timer.setSingleShot(True)
+        self._playback_prepare_timer.timeout.connect(self._run_scheduled_playback_prepare)
+        self._scheduled_project_import = False
+        self._vlc_init_timer = QTimer(self)
+        self._vlc_init_timer.setSingleShot(True)
+        self._vlc_init_timer.timeout.connect(self._run_scheduled_vlc_init)
         
         # Ensure media_player attribute exists for seek_to_position
         self.media_player = None
@@ -327,19 +617,86 @@ class SubtitleEditor(QWidget):
         self.vlc_instance = None
         self.vlc_player = None
         self.vlc_timer = None
-        self.use_vlc_playback = True
+        self.use_vlc_playback = False
         
         # Initialize UI
         self.init_ui()
-        
+
         # Set up timer for subtitle display updates
         self.subtitle_timer = QTimer(self)
         self.subtitle_timer.setInterval(100)  # Check subtitle display every 100ms
         self.subtitle_timer.timeout.connect(self.update_subtitle_display)
         self.subtitle_timer.start()
-        
-        # Media player will be initialized when data loaded
-        # self.setup_media_player()
+
+    def _snapshot_segments(self):
+        """Return a detached copy suitable for a history command."""
+        return copy.deepcopy(self.segments)
+
+    @staticmethod
+    def _selection_for_state(selection, segment_count):
+        if not segment_count:
+            return -1
+        return min(max(int(selection), 0), segment_count - 1)
+
+    def _sync_processor_segments(self):
+        """Keep the processor, editor, timeline, and exporter on one list."""
+        self.subtitle_processor.segments = self.segments
+
+    def _finish_live_history_change(self):
+        """Record the new baseline after the initial command push."""
+        self._last_history_state = self._snapshot_segments()
+
+    def _push_history_change(
+        self,
+        text,
+        before_segments,
+        before_selection,
+        after_selection=None,
+        merge_key=None,
+    ):
+        """Push one already-applied model change onto the shared undo stack."""
+        if self._history_restoring:
+            return
+        after_segments = self._snapshot_segments()
+        if before_segments == after_segments:
+            return
+        if after_selection is None:
+            after_selection = self.current_segment_index
+        self.undo_stack.push(
+            _SubtitleStateCommand(
+                self,
+                text,
+                before_segments,
+                after_segments,
+                before_selection,
+                after_selection,
+                merge_key,
+            )
+        )
+
+    def _restore_history_state(self, segments, selection):
+        """Atomically restore model and every subtitle view for undo/redo."""
+        self._history_restoring = True
+        try:
+            self.segments = copy.deepcopy(segments)
+            for index, segment in enumerate(self.segments, 1):
+                segment.index = index
+            self._sync_processor_segments()
+            self.populate_segment_list()
+            row = self._selection_for_state(selection, len(self.segments))
+            if row >= 0:
+                self.segment_list.setCurrentRow(row)
+            else:
+                self.select_segment(-1)
+            self._last_history_state = self._snapshot_segments()
+        finally:
+            self._history_restoring = False
+        self.segmentsChanged.emit()
+
+    def clear_undo_history(self):
+        """Start a clean history baseline after loading another project/video."""
+        self.undo_stack.clear()
+        self._last_history_state = self._snapshot_segments()
     
     def init_ui(self):
         """Initialize the user interface components"""
@@ -371,22 +728,37 @@ class SubtitleEditor(QWidget):
         self.video_widget.setAttribute(Qt.WA_NativeWindow)
         self.video_widget.setAttribute(Qt.WA_DontCreateNativeAncestors)
         self.video_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.video_widget.setAccessibleName("视频预览")
         # Removed minimum height to allow more space for video
         self.fallback_image_label = QLabel()
         self.fallback_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.fallback_image_label.setVisible(False)
         self.fallback_image_label.setScaledContents(False)
+        self.fallback_image_label.setAccessibleName("视频静态预览")
         # Stacked widget for video and fallback
         self.video_stack = QStackedWidget()
         self.video_stack.addWidget(self.video_widget)
         self.video_stack.addWidget(self.fallback_image_label)
-        # Allow video_stack to expand both directions, maintain aspect via resizeEvent
+        self.video_stack.currentChanged.connect(
+            lambda _index: self.subtitle_overlay_layer.raise_()
+            if hasattr(self, "subtitle_overlay_layer")
+            else None
+        )
+        # Allow the preview to expand naturally. A fixed width-derived height
+        # made short laptop windows unusable when the editor panel also needed
+        # space.
         self.video_stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        video_layout.addWidget(self.video_stack)
-        # Ensure video preview area is large enough
-        self.video_container.setMinimumHeight(300)
-        
-        # Current subtitle display overlay
+
+        # Current subtitle display is a real child overlay of video_stack,
+        # rather than a separate row that changes the video's layout.
+        video_layout.addWidget(self.video_stack, 1)
+        self.video_stack.installEventFilter(self)
+        self.subtitle_overlay_layer = QWidget(self.video_stack)
+        self.subtitle_overlay_layer.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.subtitle_overlay_layer.setAccessibleName("字幕预览覆盖层")
+        subtitle_overlay_layout = QVBoxLayout(self.subtitle_overlay_layer)
+        subtitle_overlay_layout.setContentsMargins(24, 12, 24, 20)
+        subtitle_overlay_layout.addStretch(1)
         self.subtitle_display = QLabel()
         self.subtitle_display.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.subtitle_display.setStyleSheet(
@@ -396,7 +768,15 @@ class SubtitleEditor(QWidget):
             "border-radius: 4px;"
         )
         self.subtitle_display.setWordWrap(True)
-        video_layout.addWidget(self.subtitle_display)
+        self.subtitle_display.setAccessibleName("当前字幕预览")
+        self.subtitle_display.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.subtitle_display.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum
+        )
+        self.subtitle_display.setVisible(False)
+        subtitle_overlay_layout.addWidget(self.subtitle_display)
+        self.subtitle_overlay_layer.raise_()
+        QTimer.singleShot(0, self._position_subtitle_overlay)
         
         # Video controls
         self.create_video_controls()
@@ -420,12 +800,15 @@ class SubtitleEditor(QWidget):
         self.segment_list_container = QWidget()
         segment_list_layout = QVBoxLayout(self.segment_list_container)
         
-        segment_list_header = QLabel("Subtitle Segments")
+        segment_list_header = QLabel("字幕片段")
         segment_list_header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         segment_list_layout.addWidget(segment_list_header)
         
         self.segment_list = QListWidget()
         self.segment_list.setAlternatingRowColors(True)
+        self.segment_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.segment_list.setAccessibleName("字幕片段列表")
+        self.segment_list.setToolTip("可使用 Ctrl/⌘ 或 Shift 连续多选片段后合并")
         self.segment_list.currentRowChanged.connect(self.select_segment)
         self.segment_list.itemDoubleClicked.connect(self.edit_segment)
         segment_list_layout.addWidget(self.segment_list)
@@ -433,19 +816,27 @@ class SubtitleEditor(QWidget):
         # Segment list control buttons
         segment_btn_layout = QHBoxLayout()
         
-        self.add_segment_btn = QPushButton("Add")
+        self.add_segment_btn = QPushButton("添加")
+        self.add_segment_btn.setAccessibleName("添加字幕片段")
+        self.add_segment_btn.setToolTip("在当前播放位置附近添加字幕片段")
         self.add_segment_btn.clicked.connect(self.add_segment)
         segment_btn_layout.addWidget(self.add_segment_btn)
         
-        self.remove_segment_btn = QPushButton("Remove")
+        self.remove_segment_btn = QPushButton("删除")
+        self.remove_segment_btn.setAccessibleName("删除字幕片段")
+        self.remove_segment_btn.setToolTip("删除当前字幕片段")
         self.remove_segment_btn.clicked.connect(self.remove_segment)
         segment_btn_layout.addWidget(self.remove_segment_btn)
         
-        self.merge_segments_btn = QPushButton("Merge")
+        self.merge_segments_btn = QPushButton("合并")
+        self.merge_segments_btn.setAccessibleName("合并字幕片段")
+        self.merge_segments_btn.setToolTip("合并两个或多个连续选中的字幕片段")
         self.merge_segments_btn.clicked.connect(self.merge_segments)
         segment_btn_layout.addWidget(self.merge_segments_btn)
         
-        self.split_segment_btn = QPushButton("Split")
+        self.split_segment_btn = QPushButton("拆分")
+        self.split_segment_btn.setAccessibleName("拆分字幕片段")
+        self.split_segment_btn.setToolTip("在当前播放位置拆分字幕片段（Ctrl+Shift+K）")
         self.split_segment_btn.clicked.connect(self.split_segment)
         segment_btn_layout.addWidget(self.split_segment_btn)
         
@@ -461,24 +852,28 @@ class SubtitleEditor(QWidget):
         # Editor header with timing controls
         timing_layout = QGridLayout()
         
-        timing_layout.addWidget(QLabel("Start Time:"), 0, 0)
+        timing_layout.addWidget(QLabel("开始时间："), 0, 0)
         self.start_time_edit = QDoubleSpinBox()
         self.start_time_edit.setDecimals(3)
         self.start_time_edit.setRange(0, 86400)  # 24 hours max
         self.start_time_edit.setSingleStep(0.1)
+        self.start_time_edit.setAccessibleName("字幕开始时间")
+        self.start_time_edit.setToolTip("以秒为单位，精确到毫秒")
         self.start_time_edit.valueChanged.connect(self.update_segment_timing)
         timing_layout.addWidget(self.start_time_edit, 0, 1)
         
-        timing_layout.addWidget(QLabel("End Time:"), 0, 2)
+        timing_layout.addWidget(QLabel("结束时间："), 0, 2)
         self.end_time_edit = QDoubleSpinBox()
         self.end_time_edit.setDecimals(3)
         self.end_time_edit.setRange(0, 86400)  # 24 hours max
         self.end_time_edit.setSingleStep(0.1)
+        self.end_time_edit.setAccessibleName("字幕结束时间")
+        self.end_time_edit.setToolTip("以秒为单位，不能早于开始时间")
         self.end_time_edit.valueChanged.connect(self.update_segment_timing)
         timing_layout.addWidget(self.end_time_edit, 0, 3)
         
-        timing_layout.addWidget(QLabel("Duration:"), 0, 4)
-        self.duration_label = QLabel("0.000 s")
+        timing_layout.addWidget(QLabel("持续时间："), 0, 4)
+        self.duration_label = QLabel("0.000 秒")
         timing_layout.addWidget(self.duration_label, 0, 5)
         
         editor_layout.addLayout(timing_layout)
@@ -491,10 +886,13 @@ class SubtitleEditor(QWidget):
         original_layout = QVBoxLayout(original_container)
         original_layout.setContentsMargins(0, 0, 0, 0)
         
-        original_header = QLabel("Original Text:")
+        original_header = QLabel("原文：")
         original_layout.addWidget(original_header)
         
         self.original_text_edit = QTextEdit()
+        self.original_text_edit.setAccessibleName("字幕原文")
+        self.original_text_edit.document().setUndoRedoEnabled(False)
+        self.original_text_edit.installEventFilter(self)
         self.original_text_edit.textChanged.connect(self.update_segment_original_text)
         original_layout.addWidget(self.original_text_edit)
         
@@ -505,10 +903,13 @@ class SubtitleEditor(QWidget):
         translation_layout = QVBoxLayout(translation_container)
         translation_layout.setContentsMargins(0, 0, 0, 0)
         
-        translation_header = QLabel("Translated Text:")
+        translation_header = QLabel("译文：")
         translation_layout.addWidget(translation_header)
         
         self.translation_text_edit = QTextEdit()
+        self.translation_text_edit.setAccessibleName("字幕译文")
+        self.translation_text_edit.document().setUndoRedoEnabled(False)
+        self.translation_text_edit.installEventFilter(self)
         self.translation_text_edit.textChanged.connect(self.update_segment_translation)
         translation_layout.addWidget(self.translation_text_edit)
         
@@ -538,9 +939,10 @@ class SubtitleEditor(QWidget):
         main_layout.addWidget(self.main_splitter, 1)
         
         # Status bar
-        self.status_bar = QLabel("Ready")
+        self.status_bar = QLabel("就绪")
         self.status_bar.setAlignment(Qt.AlignmentFlag.AlignRight)
-        self.status_bar.setStyleSheet("padding: 2px; background-color: #f0f0f0;")
+        self.status_bar.setAccessibleName("字幕编辑状态")
+        self.status_bar.setStyleSheet("padding: 2px;")
         main_layout.addWidget(self.status_bar)
         
         # Load segments into UI
@@ -548,42 +950,83 @@ class SubtitleEditor(QWidget):
         
         # Set keyboard shortcuts
         self.setup_shortcuts()
+
+    def eventFilter(self, watched, event):
+        """Use focus boundaries to delimit otherwise continuous edit commands."""
+        if (
+            watched is getattr(self, "video_stack", None)
+            and event.type() == QEvent.Type.Resize
+        ):
+            self._position_subtitle_overlay()
+        if event.type() == QEvent.Type.FocusIn and watched in {
+            self.original_text_edit,
+            self.translation_text_edit,
+        }:
+            self._edit_session += 1
+        return super().eventFilter(watched, event)
+
+    def _position_subtitle_overlay(self):
+        """Keep the mouse-transparent subtitle layer inside safe video margins."""
+        if not hasattr(self, "subtitle_overlay_layer"):
+            return
+        self.subtitle_overlay_layer.setGeometry(self.video_stack.rect())
+        self.subtitle_overlay_layer.raise_()
     
     def create_toolbar(self):
         """Create the toolbar with common actions"""
         self.toolbar = QToolBar()
         self.toolbar.setMovable(False)
+        self.toolbar.setAccessibleName("字幕编辑工具栏")
+
+        self.import_subtitle_action = self.toolbar.addAction("导入字幕")
+        self.import_subtitle_action.setToolTip(
+            "导入 SRT、VTT、ASS/SSA、SUB 或 SBV 字幕（Ctrl+I）"
+        )
+        self.import_subtitle_action.triggered.connect(
+            lambda _checked=False: self.importSubtitleRequested.emit()
+        )
+
+        self.toolbar.addSeparator()
         
         # Playback controls
-        self.play_action = self.toolbar.addAction("Play")
+        self.play_action = self.toolbar.addAction("播放")
+        self.play_action.setToolTip("播放或暂停视频（空格键）")
         self.play_action.triggered.connect(self.toggle_play)
         
         self.toolbar.addSeparator()
         
         # Add timing adjustment buttons
-        self.toolbar.addAction("←0.1s").triggered.connect(
+        start_back_action = self.toolbar.addAction("起点 −0.1s")
+        start_back_action.setToolTip("将当前字幕的开始时间提前 0.1 秒")
+        start_back_action.triggered.connect(
             lambda: self.adjust_current_segment_timing(-0.1, 0)
         )
-        self.toolbar.addAction("→0.1s").triggered.connect(
+        start_forward_action = self.toolbar.addAction("起点 +0.1s")
+        start_forward_action.setToolTip("将当前字幕的开始时间延后 0.1 秒")
+        start_forward_action.triggered.connect(
             lambda: self.adjust_current_segment_timing(0.1, 0)
         )
         self.toolbar.addSeparator()
-        self.toolbar.addAction("←0.1s").triggered.connect(
+        end_back_action = self.toolbar.addAction("终点 −0.1s")
+        end_back_action.setToolTip("将当前字幕的结束时间提前 0.1 秒")
+        end_back_action.triggered.connect(
             lambda: self.adjust_current_segment_timing(0, -0.1)
         )
-        self.toolbar.addAction("→0.1s").triggered.connect(
+        end_forward_action = self.toolbar.addAction("终点 +0.1s")
+        end_forward_action.setToolTip("将当前字幕的结束时间延后 0.1 秒")
+        end_forward_action.triggered.connect(
             lambda: self.adjust_current_segment_timing(0, 0.1)
         )
         
         self.toolbar.addSeparator()
         
         # View options
-        self.show_original_action = self.toolbar.addAction("Show Original")
+        self.show_original_action = self.toolbar.addAction("显示原文")
         self.show_original_action.setCheckable(True)
         self.show_original_action.setChecked(True)
         self.show_original_action.toggled.connect(self.toggle_original_display)
         
-        self.show_translation_action = self.toolbar.addAction("Show Translation")
+        self.show_translation_action = self.toolbar.addAction("显示译文")
         self.show_translation_action.setCheckable(True)
         self.show_translation_action.setChecked(True)
         self.show_translation_action.toggled.connect(self.toggle_translation_display)
@@ -591,7 +1034,8 @@ class SubtitleEditor(QWidget):
         self.toolbar.addSeparator()
         
         # Validate action
-        self.validate_action = self.toolbar.addAction("Validate")
+        self.validate_action = self.toolbar.addAction("检查字幕")
+        self.validate_action.setToolTip("检查时间重叠、时长和空文本等问题")
         self.validate_action.triggered.connect(self.validate_subtitles)
     
     def create_video_controls(self):
@@ -602,20 +1046,28 @@ class SubtitleEditor(QWidget):
         
         # Skip back 1s button
         self.back_button = QPushButton("⏪ 1s")
+        self.back_button.setAccessibleName("后退一秒")
+        self.back_button.setToolTip("后退 1 秒（左方向键）")
         self.back_button.clicked.connect(lambda: self.seek_relative(-1.0))
         controls_layout.addWidget(self.back_button)
         # Play/pause button
         self.play_button = QPushButton("▶")
+        self.play_button.setAccessibleName("播放或暂停")
+        self.play_button.setToolTip("播放或暂停视频（空格键）")
         self.play_button.clicked.connect(self.toggle_play)
         controls_layout.addWidget(self.play_button)
         # Skip forward 1s button
         self.forward_button = QPushButton("1s ⏩")
+        self.forward_button.setAccessibleName("前进一秒")
+        self.forward_button.setToolTip("前进 1 秒（右方向键）")
         self.forward_button.clicked.connect(lambda: self.seek_relative(1.0))
         controls_layout.addWidget(self.forward_button)
 
         # Position slider (full width)
         self.position_slider = QSlider(Qt.Orientation.Horizontal)
         self.position_slider.setRange(0, 1000)
+        self.position_slider.setAccessibleName("视频播放位置")
+        self.position_slider.setToolTip("拖动以定位视频播放时间")
         # Track slider events: press/move/release for smooth seeking
         self.position_slider.sliderPressed.connect(self._on_slider_pressed)
         self.position_slider.sliderMoved.connect(self._on_slider_moved)
@@ -656,16 +1108,16 @@ class SubtitleEditor(QWidget):
         )
         
         # Editing shortcuts
-        QShortcut(QKeySequence("Ctrl+E"), self).activated.connect(
+        QShortcut(QKeySequence("Ctrl+Shift+E"), self).activated.connect(
             self.edit_segment
         )
-        QShortcut(QKeySequence("Ctrl+D"), self).activated.connect(
+        QShortcut(QKeySequence("Ctrl+Shift+Delete"), self).activated.connect(
             self.remove_segment
         )
-        QShortcut(QKeySequence("Ctrl+M"), self).activated.connect(
+        QShortcut(QKeySequence("Ctrl+Shift+M"), self).activated.connect(
             self.merge_segments
         )
-        QShortcut(QKeySequence("Ctrl+S"), self).activated.connect(
+        QShortcut(QKeySequence("Ctrl+Shift+K"), self).activated.connect(
             self.split_segment
         )
         
@@ -697,12 +1149,14 @@ class SubtitleEditor(QWidget):
     
     def select_segment(self, index: int):
         """Select a segment and update the editor"""
+        if index != self.current_segment_index:
+            self._edit_session += 1
         if index < 0 or index >= len(self.segments):
             # Clear editor if no valid segment
             self.current_segment_index = -1
             self.start_time_edit.setValue(0)
             self.end_time_edit.setValue(0)
-            self.duration_label.setText("0.000 s")
+            self.duration_label.setText("0.000 秒")
             self.original_text_edit.setPlainText("")
             self.translation_text_edit.setPlainText("")
             self.start_time_edit.setEnabled(False)
@@ -730,7 +1184,7 @@ class SubtitleEditor(QWidget):
         # Set values
         self.start_time_edit.setValue(segment.start_time)
         self.end_time_edit.setValue(segment.end_time)
-        self.duration_label.setText(f"{segment.end_time - segment.start_time:.3f} s")
+        self.duration_label.setText(f"{segment.end_time - segment.start_time:.3f} 秒")
         self.original_text_edit.setPlainText(segment.original_text)
         self.translation_text_edit.setPlainText(segment.translated_text)
         
@@ -762,9 +1216,11 @@ class SubtitleEditor(QWidget):
     
     def update_segment_timing(self):
         """Update the timing of the current segment"""
-        if self.current_segment_index < 0:
+        if self.current_segment_index < 0 or self._history_restoring:
             return
-            
+
+        before_segments = self._last_history_state
+        before_selection = self.current_segment_index
         start = self.start_time_edit.value()
         end = self.end_time_edit.value()
         
@@ -779,9 +1235,10 @@ class SubtitleEditor(QWidget):
         segment = self.segments[self.current_segment_index]
         segment.start_time = start
         segment.end_time = end
+        self._sync_processor_segments()
         
         # Update duration display
-        self.duration_label.setText(f"{end - start:.3f} s")
+        self.duration_label.setText(f"{end - start:.3f} 秒")
         
         # Update list item display
         item = self.segment_list.item(self.current_segment_index)
@@ -792,6 +1249,12 @@ class SubtitleEditor(QWidget):
         self.timeline.update()
         
         # Signal that segments have changed
+        self._push_history_change(
+            "调整字幕时间",
+            before_segments,
+            before_selection,
+            merge_key=("timing", self.current_segment_index, self._edit_session),
+        )
         self.segmentsChanged.emit()
     
     def adjust_current_segment_timing(self, start_offset: float = 0, end_offset: float = 0):
@@ -813,35 +1276,54 @@ class SubtitleEditor(QWidget):
     
     def update_segment_original_text(self):
         """Update the original text of the current segment"""
-        if self.current_segment_index < 0:
+        if self.current_segment_index < 0 or self._history_restoring:
             return
-            
+
+        before_segments = self._last_history_state
+        before_selection = self.current_segment_index
         # Update segment
         segment = self.segments[self.current_segment_index]
         segment.original_text = self.original_text_edit.toPlainText()
+        self._sync_processor_segments()
         
         # Update list item display
         item = self.segment_list.item(self.current_segment_index)
         if isinstance(item, SubtitleListItem):
             item.update_display()
-            
+
+        self._push_history_change(
+            "编辑字幕原文",
+            before_segments,
+            before_selection,
+            merge_key=("original", self.current_segment_index, self._edit_session),
+        )
         # Signal that segments have changed
         self.segmentsChanged.emit()
     
     def update_segment_translation(self):
         """Update the translated text of the current segment"""
-        if self.current_segment_index < 0:
+        if self.current_segment_index < 0 or self._history_restoring:
             return
-            
+
+        before_segments = self._last_history_state
+        before_selection = self.current_segment_index
         # Update segment
         segment = self.segments[self.current_segment_index]
         segment.translated_text = self.translation_text_edit.toPlainText()
-            
+        self._sync_processor_segments()
+        self._push_history_change(
+            "编辑字幕译文",
+            before_segments,
+            before_selection,
+            merge_key=("translation", self.current_segment_index, self._edit_session),
+        )
         # Signal that segments have changed
         self.segmentsChanged.emit()
     
     def add_segment(self):
         """Add a new segment"""
+        before_segments = self._last_history_state
+        before_selection = self.current_segment_index
         # Determine where to insert the new segment
         position = self.current_position
         
@@ -856,6 +1338,7 @@ class SubtitleEditor(QWidget):
         
         # Add to segments list
         self.segments.append(new_segment)
+        self._sync_processor_segments()
         
         # Add to UI
         item = SubtitleListItem(new_segment, len(self.segments))
@@ -869,6 +1352,12 @@ class SubtitleEditor(QWidget):
         self.timeline.update()
         
         # Signal that segments have changed
+        self._push_history_change(
+            "添加字幕片段",
+            before_segments,
+            before_selection,
+            after_selection=len(self.segments) - 1,
+        )
         self.segmentsChanged.emit()
         
         # Set focus to text editor
@@ -878,9 +1367,12 @@ class SubtitleEditor(QWidget):
         """Remove the selected segment"""
         if self.current_segment_index < 0:
             return
-            
+
+        before_segments = self._last_history_state
+        before_selection = self.current_segment_index
         # Remove from segments list
         self.segments.pop(self.current_segment_index)
+        self._sync_processor_segments()
         
         # Remove from UI
         self.segment_list.takeItem(self.current_segment_index)
@@ -905,17 +1397,26 @@ class SubtitleEditor(QWidget):
         self.timeline.update()
         
         # Signal that segments have changed
+        self._push_history_change(
+            "删除字幕片段",
+            before_segments,
+            before_selection,
+            after_selection=self.current_segment_index,
+        )
         self.segmentsChanged.emit()
     
     def edit_segment(self):
         """Open detailed edit dialog for current segment"""
         if self.current_segment_index < 0:
             return
-            
+
+        before_segments = self._last_history_state
+        before_selection = self.current_segment_index
         segment = self.segments[self.current_segment_index]
         dialog = SegmentEditDialog(segment, self)
         
         if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._sync_processor_segments()
             # Segment was updated in the dialog, update UI
             item = self.segment_list.item(self.current_segment_index)
             if isinstance(item, SubtitleListItem):
@@ -928,6 +1429,11 @@ class SubtitleEditor(QWidget):
             self.timeline.update()
             
             # Signal that segments have changed
+            self._push_history_change(
+                "编辑字幕片段",
+                before_segments,
+                before_selection,
+            )
             self.segmentsChanged.emit()
     
     def merge_segments(self):
@@ -936,7 +1442,7 @@ class SubtitleEditor(QWidget):
         selected_items = self.segment_list.selectedItems()
         if len(selected_items) < 2:
             # Need at least 2 segments to merge
-            self.status_bar.setText("Select at least 2 segments to merge (Ctrl+click to select multiple)")
+            self.status_bar.setText("请至少选择 2 个连续字幕片段（Ctrl/⌘ 或 Shift 多选）")
             return
             
         # Get indices of selected items
@@ -944,32 +1450,49 @@ class SubtitleEditor(QWidget):
         
         # Verify they are consecutive
         if indices[-1] - indices[0] + 1 != len(indices):
-            self.status_bar.setText("Can only merge consecutive segments")
+            self.status_bar.setText("只能合并连续的字幕片段")
             return
+
+        before_segments = self._last_history_state
+        before_selection = self.current_segment_index
+        selected_after = indices[0]
         
         # Perform merge
         try:
             self.subtitle_processor.merge_segments(indices[0], indices[-1])
+
+            # SubtitleProcessor replaces its list when merging; keep the
+            # editor, timeline, and exporter on the new canonical list.
+            self.segments = self.subtitle_processor.segments
             
             # Update UI
             self.populate_segment_list()
             
             # Select the merged segment
-            self.segment_list.setCurrentRow(indices[0])
+            self.segment_list.setCurrentRow(selected_after)
             
             # Signal that segments have changed
+            self._push_history_change(
+                "合并字幕片段",
+                before_segments,
+                before_selection,
+                after_selection=selected_after,
+            )
             self.segmentsChanged.emit()
             
-            self.status_bar.setText(f"Merged {len(indices)} segments")
+            self.status_bar.setText(f"已合并 {len(indices)} 个字幕片段")
             
         except Exception as e:
-            self.status_bar.setText(f"Error merging segments: {str(e)}")
+            self.status_bar.setText(f"合并字幕失败：{str(e)}")
     
     def split_segment(self):
         """Split the selected segment at current position"""
         if self.current_segment_index < 0:
             return
-            
+
+        before_segments = self._last_history_state
+        before_selection = self.current_segment_index
+        selected_after = self.current_segment_index
         segment = self.segments[self.current_segment_index]
         
         # Check if current position is within segment
@@ -982,20 +1505,30 @@ class SubtitleEditor(QWidget):
         try:
             # Perform split
             self.subtitle_processor.split_segment(self.current_segment_index, split_time)
+
+            # SubtitleProcessor replaces its list when splitting; refresh the
+            # editor reference before rebuilding the list and exporting.
+            self.segments = self.subtitle_processor.segments
             
             # Update UI
             self.populate_segment_list()
             
             # Select the first of the split segments
-            self.segment_list.setCurrentRow(self.current_segment_index)
+            self.segment_list.setCurrentRow(selected_after)
             
             # Signal that segments have changed
+            self._push_history_change(
+                "拆分字幕片段",
+                before_segments,
+                before_selection,
+                after_selection=selected_after,
+            )
             self.segmentsChanged.emit()
             
-            self.status_bar.setText(f"Split segment at {split_time:.3f}s")
+            self.status_bar.setText(f"已在 {split_time:.3f} 秒处拆分字幕")
             
         except Exception as e:
-            self.status_bar.setText(f"Error splitting segment: {str(e)}")
+            self.status_bar.setText(f"拆分字幕失败：{str(e)}")
     
     def next_segment(self):
         """Select the next segment"""
@@ -1012,7 +1545,7 @@ class SubtitleEditor(QWidget):
         issues = self.subtitle_processor.validate_subtitles()
         
         if not issues:
-            self.status_bar.setText("No issues found in subtitles")
+            self.status_bar.setText("字幕检查通过，未发现问题")
             return
             
         # Count issues by type
@@ -1021,21 +1554,38 @@ class SubtitleEditor(QWidget):
         
         # Show summary in status bar
         self.status_bar.setText(
-            f"Found {len(issues)} issues: {error_count} errors, {warning_count} warnings"
+            f"发现 {len(issues)} 个问题：{error_count} 个错误，{warning_count} 个警告"
         )
         
-        # TODO: Show detailed validation results in a dialog
-        # For now, just log them
         for issue in issues:
             segment_info = f"segment {issue['segment_idx'] + 1}" if issue['segment_idx'] is not None else "global"
             logger.warning(f"{issue['type'].upper()} in {segment_info}: {issue['message']}")
+
+        dialog = SubtitleValidationDialog(issues, self)
+        dialog.issueActivated.connect(self._focus_validation_issue)
+        # Retain the latest dialog for accessibility tooling and UI tests.
+        self._validation_dialog = dialog
+        dialog.exec()
+
+    def _focus_validation_issue(self, segment_idx: int):
+        """Select and reveal the segment associated with a validation issue."""
+        if not 0 <= segment_idx < self.segment_list.count():
+            return
+        self.segment_list.setCurrentRow(segment_idx)
+        item = self.segment_list.item(segment_idx)
+        self.segment_list.scrollToItem(item)
+        self.original_text_edit.setFocus()
+        self.status_bar.setText(f"已定位到第 {segment_idx + 1} 个字幕片段")
     
     def toggle_play(self):
         """Toggle video playback: use VLC"""
         # Protect against uninitialized VLC player
         if not hasattr(self, 'vlc_player') or self.vlc_player is None:
-            self.status_bar.setText("错误: 视频播放器未初始化")
-            logger.error("尝试播放但 VLC 播放器未初始化")
+            if not is_vlc_available():
+                self.status_bar.setText("当前环境未安装 VLC，仅提供静态画面预览")
+            else:
+                self.status_bar.setText("视频播放器尚未就绪")
+            logger.info("尝试播放但 VLC 播放器未初始化")
             return
             
         # Toggle VLC playback only
@@ -1055,7 +1605,7 @@ class SubtitleEditor(QWidget):
                     self.vlc_timer.start()
             # update UI text/icons
             self.play_button.setText("⏸" if self.is_playing else "▶")
-            self.play_action.setText("Pause" if self.is_playing else "Play")
+            self.play_action.setText("暂停" if self.is_playing else "播放")
             self.playStateChanged.emit(self.is_playing)
         except Exception as e:
             logger.error(f"切换播放状态时出错: {str(e)}")
@@ -1069,26 +1619,18 @@ class SubtitleEditor(QWidget):
         
         # Update button text
         self.play_button.setText("⏸" if self.is_playing else "▶")
-        self.play_action.setText("Pause" if self.is_playing else "Play")
+        self.play_action.setText("暂停" if self.is_playing else "播放")
         
         # Emit signal
         self.playStateChanged.emit(self.is_playing)
     
     def undo(self):
-        """Stub for undo action"""
-        # 调用文本编辑框撤销
-        if self.original_text_edit.hasFocus():
-            self.original_text_edit.undo()
-        elif self.translation_text_edit.hasFocus():
-            self.translation_text_edit.undo()
-    
+        """Undo the latest subtitle-model operation, regardless of focus."""
+        self.undo_stack.undo()
+
     def redo(self):
-        """Stub for redo action"""
-        # 调用文本编辑框重做
-        if self.original_text_edit.hasFocus():
-            self.original_text_edit.redo()
-        elif self.translation_text_edit.hasFocus():
-            self.translation_text_edit.redo()
+        """Redo the latest subtitle-model operation, regardless of focus."""
+        self.undo_stack.redo()
     
     def seek_to_position(self, position_seconds: float):
         """Seek to specific position in the video."""
@@ -1108,6 +1650,7 @@ class SubtitleEditor(QWidget):
         """Update the subtitle display based on current position"""
         if not self.segments:
             self.subtitle_display.setText("")
+            self.subtitle_display.setVisible(False)
             return
             
         position = self.current_position
@@ -1129,10 +1672,13 @@ class SubtitleEditor(QWidget):
                     display_text += segment.translated_text
                 
                 self.subtitle_display.setText(display_text)
+                self.subtitle_display.setVisible(bool(display_text))
+                self.subtitle_overlay_layer.raise_()
                 break
         
         if not found:
             self.subtitle_display.setText("")
+            self.subtitle_display.setVisible(False)
     
     def toggle_original_display(self, show: bool):
         """Toggle display of original text in preview"""
@@ -1147,7 +1693,7 @@ class SubtitleEditor(QWidget):
         # 接收错误代码和可选错误字符串
         msg = error_string or self.media_player.errorString()
         logger.error(f"Media player error: {msg} (code: {error})")
-        self.status_bar.setText(f"Error: {msg}")
+        self.status_bar.setText(f"播放错误：{msg}")
         # 媒体加载失败时立即回退到静态图
         QTimer.singleShot(0, self._media_fallback)
     
@@ -1159,6 +1705,8 @@ class SubtitleEditor(QWidget):
         """
         加载处理结果并初始化编辑器
         """
+        self._invalidate_fallback_requests()
+
         # 标记加载来源 - 用于后续差异化处理
         is_project_import = result_data.get('is_project_import', False) or (video_path and video_path.lower().endswith('.vtp'))
         # # 如果导入的是与当前视频相同的项目文件，仅更新字幕列表，跳过播放器重置
@@ -1169,6 +1717,7 @@ class SubtitleEditor(QWidget):
             self.subtitle_processor.create_from_segments(raw_segments)
             self.segments = self.subtitle_processor.segments
             self.populate_segment_list()
+            self.clear_undo_history()
             return
 
         # 【关键修复】在加载新视频之前，先清理旧的VLC实例
@@ -1230,10 +1779,12 @@ class SubtitleEditor(QWidget):
         
         # 3. 刷新界面显示
         self.populate_segment_list()
+        self.clear_undo_history()
         
         # 4. 准备视频播放 - 在与用户交互完成后执行
         # 使用延时初始化确保窗口状态稳定
-        QTimer.singleShot(500, lambda: self._prepare_video_playback(is_project_import))
+        self._scheduled_project_import = bool(is_project_import)
+        self._playback_prepare_timer.start(500)
         
         # 5. 设置视频宽高比
         try:
@@ -1251,6 +1802,8 @@ class SubtitleEditor(QWidget):
 
     def _prepare_video_playback(self, is_project_import=False):
         """统一的视频播放准备流程"""
+        if self._is_closing:
+            return
         # 首先清理任何现有的VLC实例（视频切换时的关键步骤）
         self._cleanup_vlc_player()
         
@@ -1272,16 +1825,28 @@ class SubtitleEditor(QWidget):
             self.video_widget.setFocus()
             QApplication.processEvents()
             # 使用更长的延迟确保窗口状态稳定
-            QTimer.singleShot(300, lambda: self._init_vlc_playback(is_project_import))
+            self._scheduled_project_import = bool(is_project_import)
+            self._vlc_init_timer.start(300)
         else:
             # 正常流程直接初始化
             self._init_vlc_playback(is_project_import)
 
+    def _run_scheduled_playback_prepare(self):
+        """Run QObject-owned delayed playback work only while the editor lives."""
+        if not self._is_closing:
+            self._prepare_video_playback(self._scheduled_project_import)
+
+    def _run_scheduled_vlc_init(self):
+        if not self._is_closing:
+            self._init_vlc_playback(self._scheduled_project_import)
+
     def _init_vlc_playback(self, is_project_import=False):
         """重构的VLC初始化方法，适用于所有加载场景"""
         # 检查VLC可用性
-        if not vlc_available:
-            logger.error("VLC 不可用，无法初始化播放器")
+        if not is_vlc_available():
+            self.use_vlc_playback = False
+            logger.info("VLC 不可用，改用静态画面预览")
+            self.status_bar.setText("未检测到 VLC，已切换到静态画面预览")
             self._media_fallback()
             return
         
@@ -1455,9 +2020,12 @@ class SubtitleEditor(QWidget):
             QTimer.singleShot(1500, self._force_embedded_mode)
             
             logger.info(f"VLC 播放器初始化成功: {self.video_path}")
+            self.use_vlc_playback = True
             
         except Exception as e:
             logger.error(f"VLC 初始化失败: {str(e)}")
+            self.use_vlc_playback = False
+            self.status_bar.setText("VLC 初始化失败，已切换到静态画面预览")
             self._media_fallback()
             self.vlc_instance = None
             self.vlc_player = None
@@ -1499,58 +2067,95 @@ class SubtitleEditor(QWidget):
             pass
 
     def _media_fallback(self):
-        """Fallback to show first frame via ffmpeg if media not available"""
-        # 保存临时图像的路径
-        global temp_img
-        temp_img = os.path.join(tempfile.gettempdir(), f"frame_{uuid.uuid4().hex}.jpg")
-        
-        # use mktemp to avoid file lock issues
-        if shutil.which('ffmpeg') is None:
+        """Start a generation-safe FFmpeg static-preview request."""
+        self._invalidate_fallback_requests()
+        if self._is_closing:
+            return
+
+        ffmpeg_path = shutil.which("ffmpeg")
+        if ffmpeg_path is None:
             logger.warning("ffmpeg not found, cannot extract frame.")
-            self.fallback_image_label.setText("视频预览不可用")
-            self.fallback_image_label.setVisible(True)
-            self.fallback_image_label.raise_()
-            self.video_widget.setVisible(False)
+            self._show_fallback_message("视频预览不可用：未找到 FFmpeg")
             return
-            
-        # 确保视频路径有效
-        if not self.video_path or not os.path.exists(self.video_path):
-            logger.warning(f"视频文件不存在，无法提取首帧: {self.video_path}")
-            self.fallback_image_label.setText("视频文件不存在")
-            self.fallback_image_label.setVisible(True)
-            self.fallback_image_label.raise_()
-            self.video_widget.setVisible(False)
+
+        if not self.video_path or not os.path.isfile(self.video_path):
+            logger.warning("视频文件不存在，无法提取首帧: %s", self.video_path)
+            self._show_fallback_message("视频文件不存在")
             return
-            
-        try:
-            import subprocess
-            subprocess.run([
-                'ffmpeg', '-y', '-i', self.video_path,
-                '-ss', '00:00:00', '-frames:v', '1', temp_img
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-            if os.path.exists(temp_img):
-                pixmap = QPixmap(temp_img)
-                size = self.video_widget.size()
-                scaled = pixmap.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                self.fallback_image_label.setPixmap(scaled)
-            else:
-                self.fallback_image_label.setText("视频预览不可用")
-            self.fallback_image_label.setVisible(True)
-            self.fallback_image_label.raise_()
-            self.video_widget.setVisible(False)
-        except Exception as e:
-            logger.error(f"Fallback frame extract failed: {e}")
-            self.fallback_image_label.setText("视频预览不可用")
-            self.fallback_image_label.setVisible(True)
-            self.fallback_image_label.raise_()
-            self.video_widget.setVisible(False)
-        finally:
-            try: 
-                if os.path.exists(temp_img):
-                    os.remove(temp_img)
-            except Exception as e: 
-                logger.debug(f"无法删除临时文件 {temp_img}: {e}")
-                pass
+
+        request_id = self._fallback_generation
+        video_path = os.path.abspath(self.video_path)
+        self._show_fallback_message("正在生成静态预览…")
+        task = _FrameExtractionTask(request_id, video_path, ffmpeg_path)
+        self._fallback_tasks[request_id] = task
+        task.signals.succeeded.connect(self._fallback_frame_ready)
+        task.signals.failed.connect(self._fallback_frame_failed)
+        self._fallback_thread_pool.start(task)
+
+    def _invalidate_fallback_requests(self):
+        """Make all earlier asynchronous frame results stale."""
+        self._fallback_generation += 1
+
+    def _show_fallback_message(self, message: str):
+        self._fallback_source_pixmap = QPixmap()
+        self.fallback_image_label.clear()
+        self.fallback_image_label.setText(message)
+        self.video_stack.setCurrentWidget(self.fallback_image_label)
+        self.fallback_image_label.show()
+        self.subtitle_overlay_layer.raise_()
+
+    @pyqtSlot(int, str, bytes)
+    def _fallback_frame_ready(
+        self, request_id: int, video_path: str, frame_data: bytes
+    ):
+        self._fallback_tasks.pop(request_id, None)
+        if (
+            self._is_closing
+            or request_id != self._fallback_generation
+            or os.path.abspath(self.video_path or "") != os.path.abspath(video_path)
+        ):
+            return
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(frame_data):
+            self._show_fallback_message("视频预览不可用")
+            return
+        self._fallback_source_pixmap = pixmap
+        self.fallback_image_label.setText("")
+        self._scale_fallback_pixmap()
+        self.video_stack.setCurrentWidget(self.fallback_image_label)
+        self.fallback_image_label.show()
+        self.subtitle_overlay_layer.raise_()
+
+    @pyqtSlot(int, str, str)
+    def _fallback_frame_failed(
+        self, request_id: int, video_path: str, message: str
+    ):
+        self._fallback_tasks.pop(request_id, None)
+        if (
+            self._is_closing
+            or request_id != self._fallback_generation
+            or os.path.abspath(self.video_path or "") != os.path.abspath(video_path)
+        ):
+            return
+        logger.warning("Fallback frame extract failed: %s", message)
+        self._show_fallback_message("视频预览不可用")
+
+    def _scale_fallback_pixmap(self):
+        """Scale the retained source pixmap into the currently available box."""
+        if self._fallback_source_pixmap.isNull():
+            return
+        size = self.fallback_image_label.contentsRect().size()
+        if size.width() <= 0 or size.height() <= 0:
+            size = self.video_stack.size()
+        if size.width() <= 0 or size.height() <= 0:
+            return
+        self.fallback_image_label.setPixmap(
+            self._fallback_source_pixmap.scaled(
+                size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
 
     def _update_timeline_duration(self):
         """Update timeline duration from media player if loaded"""
@@ -1559,37 +2164,29 @@ class SubtitleEditor(QWidget):
             self.timeline.set_duration(duration_ms / 1000.0)
 
     def _check_playback_and_fallback(self):
-        """Choose playback backend: QMediaPlayer, VLC, or OpenCV"""
+        """在 Qt 或 VLC 不可用时明确降级到静态 FFmpeg 画面。"""
         if self.media_player and self.media_player.isVideoAvailable():
             # use QMediaPlayer
             self.use_vlc_playback = False
             return
-            
-        # 检查 VLC 是否可用
-        if not vlc_available:
-            logger.warning("VLC 不可用，直接使用备用播放方式")
-            self.use_cv_playback = True
-            self._init_cv_playback()
+
+        # Try VLC lazily. A static FFmpeg frame is the deterministic fallback.
+        if not is_vlc_available():
+            self.use_vlc_playback = False
+            self.status_bar.setText("未检测到 VLC，仅提供静态画面预览")
             self._media_fallback()
             return
-            
-        # try VLC playback
+
         try:
             self._init_vlc_playback()
-            # if VLC media length available, choose it
-            if hasattr(self, 'vlc_player') and self.vlc_player and self.vlc_player.get_length() > 0:
+            if hasattr(self, 'vlc_player') and self.vlc_player:
                 self.use_vlc_playback = True
                 return
         except Exception as e:
-            logger.warning(f"VLC init failed: {e}")
-            
-        # fallback to OpenCV
-        self.use_cv_playback = True
-        try:
-            self._init_cv_playback()
-        except Exception as e:
-            logger.error(f"OpenCV 初始化失败: {e}")
-            self.status_bar.setText("无法初始化视频播放")
+            logger.warning(f"VLC 初始化失败: {e}")
+
+        self.use_vlc_playback = False
+        self.status_bar.setText("视频播放不可用，仅提供静态画面预览")
         self._media_fallback()
 
     def _on_vlc_end(self):
@@ -1601,7 +2198,7 @@ class SubtitleEditor(QWidget):
             self.vlc_player.stop()
         self.is_playing = False
         self.play_button.setText("▶")
-        self.play_action.setText("Play")
+        self.play_action.setText("播放")
         # Reset position
         self.current_position = 0.0
         self.position_slider.blockSignals(True)
@@ -1639,23 +2236,13 @@ class SubtitleEditor(QWidget):
         logger.info(f"VideoAvailableChanged: available={available}")
 
     def resizeEvent(self, event):
-        """Override resize to maintain video aspect ratio"""
+        """Rescale a static fallback without constraining the editor layout."""
         super().resizeEvent(event)
-        if hasattr(self, 'video_aspect_ratio') and self.video_aspect_ratio:
-            w = self.video_stack.width()
-            h = int(w / self.video_aspect_ratio)
-            # enforce width; height auto adjusted by layout
-            self.video_widget.setFixedHeight(h)
-            self.fallback_image_label.setFixedHeight(h)
+        self._scale_fallback_pixmap()
 
     def _apply_aspect_ratio(self):
-        """Apply fixed aspect ratio to video display area"""
-        if hasattr(self, 'video_aspect_ratio') and self.video_aspect_ratio:
-            w = self.video_stack.width()
-            h = int(w / self.video_aspect_ratio)
-            # enforce width; height auto adjusted by layout
-            self.video_widget.setFixedHeight(h)
-            self.fallback_image_label.setFixedHeight(h)
+        """Refresh the fallback image within the layout-managed preview box."""
+        self._scale_fallback_pixmap()
 
     def slider_position_changed(self, position):
         """Handle slider position change"""
@@ -1699,9 +2286,6 @@ class SubtitleEditor(QWidget):
             dur_ms = self.vlc_player.get_length() or 0
             position = self.current_position
             duration = dur_ms / 1000.0
-        elif hasattr(self, 'cv_duration') and self.use_cv_playback:
-            position = self.current_position
-            duration = getattr(self, 'cv_duration', 0)
         else:
             position = self.current_position
             duration = self.media_player.duration() / 1000.0 if self.media_player else 0
@@ -1737,7 +2321,7 @@ class SubtitleEditor(QWidget):
             self.vlc_player.pause()
             self.is_playing = False
             self.play_button.setText("▶")
-            self.play_action.setText("Play")
+            self.play_action.setText("播放")
 
     def _on_slider_moved(self, value: int):
         """Preview position as user drags the slider"""
@@ -1765,7 +2349,7 @@ class SubtitleEditor(QWidget):
                     self.vlc_player.play()
                     self.is_playing = True
                     self.play_button.setText("⏸")
-                    self.play_action.setText("Pause")
+                    self.play_action.setText("暂停")
                 else:
                     self.vlc_player.pause()
                     self.is_playing = False
@@ -1887,6 +2471,20 @@ class SubtitleEditor(QWidget):
             
         except Exception as e:
             logger.error(f"清理VLC播放器时发生错误: {e}")
+
+    def closeEvent(self, event):
+        """Invalidate background preview callbacks before Qt destroys widgets."""
+        self.shutdown_media_preview()
+        super().closeEvent(event)
+
+    def shutdown_media_preview(self):
+        """Stop accepting preview results during application shutdown."""
+        self._is_closing = True
+        self._playback_prepare_timer.stop()
+        self._vlc_init_timer.stop()
+        self._invalidate_fallback_requests()
+        self.subtitle_timer.stop()
+        self._cleanup_vlc_player()
 
 # 添加类别名，使SubtitleEditor指向SubtitleEditor
 SubtitleEditorWidget = SubtitleEditor  # 兼容性别名

@@ -5,16 +5,15 @@ Memory Management utilities for video processing.
 提供内存监控、限制和优化功能。
 """
 
-import os
 import gc
-import sys
-import time
-import psutil
 import logging
 import threading
-from typing import Optional, Callable, Dict, Any
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Any, Callable, Dict, Optional
+
+import psutil
 
 logger = logging.getLogger(__name__)
 
@@ -318,7 +317,7 @@ def get_memory_usage_recommendation(file_size_mb: float) -> Dict[str, Any]:
     
     elif estimated_memory_mb > stats.available_mb * 0.7:
         recommendation['warning_message'] = (
-            f"内存使用可能较高，建议关闭其他程序以确保处理顺利"
+            "内存使用可能较高，建议关闭其他程序以确保处理顺利"
         )
     
     return recommendation

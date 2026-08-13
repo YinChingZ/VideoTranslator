@@ -5,26 +5,17 @@ Enhanced audio processing module for video translation system.
 优化的音频处理模块，支持流式处理和内存优化
 """
 
-import os
-import uuid
-import logging
-import tempfile
-import numpy as np
-from typing import Dict, List, Tuple, Optional, Union, Any, Iterator
-from pathlib import Path
-from contextlib import contextmanager
 import gc
+import logging
+import os
+import tempfile
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 
 import ffmpeg
-from pydub import AudioSegment
-import librosa
-
-from app.utils.memory_manager import (
-    memory_managed_operation, 
-    MemoryMonitor, 
-    ChunkedProcessor,
-    get_memory_usage_recommendation
-)
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +70,25 @@ class AudioProcessor:
         
         # 强制垃圾回收
         gc.collect()
+
+    @staticmethod
+    def _reserve_sibling(destination: Path, suffix: str) -> Path:
+        """Reserve a unique sibling for an atomic user-visible file commit."""
+
+        descriptor, value = tempfile.mkstemp(
+            prefix=".videotranslator-audio-",
+            suffix=suffix,
+            dir=destination.parent,
+        )
+        os.close(descriptor)
+        return Path(value)
+
+    @staticmethod
+    def _remove_file(path: Path) -> None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("无法清理临时音频文件: %s", path)
     
     def extract_audio_from_video(self, video_path: Union[str, Path], 
                                output_path: Optional[Union[str, Path]] = None, 
@@ -97,43 +107,58 @@ class AudioProcessor:
         Returns:
             音频文件路径，失败则返回None
         """
-        video_path = Path(video_path)
+        video_path = Path(video_path).expanduser().resolve()
         if not video_path.exists():
             raise AudioProcessingError(f"视频文件不存在: {video_path}")
-        
+
+        audio_format = str(format).lower().lstrip('.')
+        commit_output = output_path is not None
+        if commit_output:
+            destination = Path(output_path).expanduser().resolve()
+            if destination == video_path:
+                raise AudioProcessingError("拒绝用提取的音频覆盖源视频")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            staging = self._reserve_sibling(
+                destination, destination.suffix or f".{audio_format}"
+            )
+        else:
+            destination = self.temp_dir / f"audio_{uuid.uuid4().hex}.{audio_format}"
+            staging = destination
+
         try:
-            if output_path is None:
-                output_path = self.temp_dir / f"audio_{uuid.uuid4().hex}.{format}"
-            else:
-                output_path = Path(output_path)
-            
             # 使用ffmpeg直接流式处理，避免加载整个文件到内存
             stream = ffmpeg.input(str(video_path))
             # 直接设置音频参数，避免复杂的滤镜链
             out = ffmpeg.output(
                 stream.audio,
-                str(output_path),
+                str(staging),
                 acodec='pcm_s16le',  # 使用PCM编码
                 ac=channels,         # 声道数
                 ar=sample_rate,      # 采样率
-                format=format
+                format=audio_format
             )
             
             # 运行ffmpeg命令
             ffmpeg.run(out, overwrite_output=True, quiet=True)
             
-            if output_path.exists():
-                logger.info(f"成功提取音频: {video_path} -> {output_path}")
-                return output_path
-            else:
+            if not staging.is_file() or staging.stat().st_size == 0:
                 raise AudioProcessingError("音频提取失败，输出文件不存在")
+
+            if commit_output:
+                os.replace(staging, destination)
+            logger.info(f"成功提取音频: {video_path} -> {destination}")
+            return destination
                 
         except ffmpeg.Error as e:
             error_msg = e.stderr.decode() if e.stderr else str(e)
             logger.error(f"FFmpeg音频提取失败: {error_msg}")
+            self._remove_file(staging)
             raise AudioProcessingError(f"FFmpeg错误: {error_msg}")
         except Exception as e:
             logger.error(f"音频提取失败: {e}")
+            self._remove_file(staging)
+            if isinstance(e, AudioProcessingError):
+                raise
             raise AudioProcessingError(f"音频提取失败: {e}")
     
     def preprocess_audio_for_speech(self, audio_path: Union[str, Path], 
@@ -154,42 +179,70 @@ class AudioProcessor:
         Returns:
             处理后的音频文件路径，失败则返回None
         """
-        audio_path = Path(audio_path)
+        audio_path = Path(audio_path).expanduser().resolve()
         if not audio_path.exists():
             raise AudioProcessingError(f"音频文件不存在: {audio_path}")
-        
+
+        commit_output = output_path is not None
+        if commit_output:
+            destination = Path(output_path).expanduser().resolve()
+            if destination == audio_path:
+                raise AudioProcessingError("拒绝用预处理结果覆盖源音频")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            staging = self._reserve_sibling(destination, destination.suffix or ".wav")
+        else:
+            destination = self.temp_dir / f"processed_{uuid.uuid4().hex}.wav"
+            staging = destination
+
         try:
-            if output_path is None:
-                output_path = self.temp_dir / f"processed_{uuid.uuid4().hex}.wav"
-            else:
-                output_path = Path(output_path)
-            
-            # 分块处理音频以减少内存使用
+            try:
+                import soundfile as sf
+            except ImportError as exc:
+                raise AudioProcessingError(
+                    "保存预处理音频需要 soundfile；请安装 soundfile "
+                    "（librosa 0.10+ 使用它替代已移除的 librosa.output.write_wav）"
+                ) from exc
+
+            staging.parent.mkdir(parents=True, exist_ok=True)
+
+            # Stream processed chunks directly to disk.  This avoids both the
+            # removed librosa.output.write_wav API and concatenating the full
+            # recording back into memory after chunk processing.
+            wrote_audio = False
             with self._process_audio_chunks(audio_path, target_sample_rate) as processor:
-                processed_chunks = []
-                
-                for chunk_data, sr in processor:
-                    # 处理音频块
-                    if noise_reduction:
-                        chunk_data = self._apply_noise_reduction(chunk_data, sr)
-                    
-                    if normalize:
-                        chunk_data = self._normalize_audio(chunk_data)
-                    
-                    processed_chunks.append(chunk_data)
-                
-                # 合并所有处理后的块
-                if processed_chunks:
-                    final_audio = np.concatenate(processed_chunks)
-                    
-                    # 保存最终音频
-                    librosa.output.write_wav(str(output_path), final_audio, target_sample_rate)
-                    
-                    logger.info(f"音频预处理完成: {audio_path} -> {output_path}")
-                    return output_path
+                with sf.SoundFile(
+                    str(staging),
+                    mode="w",
+                    samplerate=target_sample_rate,
+                    channels=1,
+                    format="WAV",
+                    subtype="PCM_16",
+                ) as output_file:
+                    for chunk_data, sr in processor:
+                        if noise_reduction:
+                            chunk_data = self._apply_noise_reduction(chunk_data, sr)
+
+                        if normalize:
+                            chunk_data = self._normalize_audio(chunk_data)
+
+                        output_file.write(np.asarray(chunk_data, dtype=np.float32))
+                        wrote_audio = True
+
+            if wrote_audio:
+                if not staging.is_file() or staging.stat().st_size == 0:
+                    raise AudioProcessingError("音频预处理未生成有效文件")
+                if commit_output:
+                    os.replace(staging, destination)
+                logger.info(f"音频预处理完成: {audio_path} -> {destination}")
+                return destination
+
+            self._remove_file(staging)
             
         except Exception as e:
             logger.error(f"音频预处理失败: {e}")
+            self._remove_file(staging)
+            if isinstance(e, AudioProcessingError):
+                raise
             raise AudioProcessingError(f"音频预处理失败: {e}")
         
         return None
@@ -197,26 +250,48 @@ class AudioProcessor:
     @contextmanager
     def _process_audio_chunks(self, audio_path: Path, target_sr: int, chunk_duration: float = 30.0):
         """音频分块处理的上下文管理器"""
+        audio_file = None
         try:
-            # 获取音频信息
-            y, sr = librosa.load(str(audio_path), sr=None)
-            
-            # 计算块大小
-            chunk_size = int(chunk_duration * sr)
-            
+            try:
+                import soundfile as sf
+            except ImportError as exc:
+                raise AudioProcessingError(
+                    "流式音频处理需要 soundfile；请安装 soundfile"
+                ) from exc
+
+            audio_file = sf.SoundFile(str(audio_path), mode="r")
+            sr = audio_file.samplerate
+            chunk_size = max(1, int(chunk_duration * sr))
+
             def chunk_generator():
-                for i in range(0, len(y), chunk_size):
-                    chunk = y[i:i + chunk_size]
-                    # 重采样到目标采样率
+                while True:
+                    chunk = audio_file.read(
+                        frames=chunk_size,
+                        dtype="float32",
+                        always_2d=False,
+                    )
+                    if chunk.size == 0:
+                        break
+
+                    # Whisper expects mono audio.  Average channels instead of
+                    # silently selecting only one side of a stereo recording.
+                    if chunk.ndim > 1:
+                        chunk = np.mean(chunk, axis=1)
+
                     if sr != target_sr:
+                        try:
+                            import librosa
+                        except ImportError as exc:
+                            raise AudioProcessingError(
+                                "重采样音频需要 librosa；请安装 librosa"
+                            ) from exc
                         chunk = librosa.resample(chunk, orig_sr=sr, target_sr=target_sr)
                     yield chunk, target_sr
-            
+
             yield chunk_generator()
-            
         finally:
-            # 清理内存
-            del y
+            if audio_file is not None:
+                audio_file.close()
             gc.collect()
     
     def _apply_noise_reduction(self, audio_data: np.ndarray, sample_rate: int) -> np.ndarray:
@@ -284,6 +359,14 @@ class AudioProcessor:
             raise AudioProcessingError(f"音频文件不存在: {audio_path}")
         
         try:
+            try:
+                from pydub import AudioSegment
+                from pydub.silence import split_on_silence
+            except ImportError as exc:
+                raise AudioProcessingError(
+                    "按静音分割音频需要 pydub；请安装媒体增强依赖"
+                ) from exc
+
             if output_dir is None:
                 output_dir = self.temp_dir / f"segments_{uuid.uuid4().hex}"
             else:
@@ -295,8 +378,6 @@ class AudioProcessor:
             audio = AudioSegment.from_file(str(audio_path))
             
             # 检测静音分割点
-            from pydub.silence import split_on_silence
-            
             chunks = split_on_silence(
                 audio,
                 min_silence_len=min_silence_len,
@@ -323,8 +404,8 @@ class AudioProcessor:
             logger.error(f"音频分割失败: {e}")
             raise AudioProcessingError(f"音频分割失败: {e}")
     
-    def _optimize_chunks(self, chunks: List[AudioSegment], 
-                        max_length: int, min_length: int = 1000) -> List[AudioSegment]:
+    def _optimize_chunks(self, chunks: List[Any],
+                        max_length: int, min_length: int = 1000) -> List[Any]:
         """优化音频片段长度"""
         if not chunks:
             return []
